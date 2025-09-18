@@ -240,6 +240,7 @@ def predict():
                 today_data["pollutant"] = pollutant
                 today_pollutants.append(today_data)
 
+        # Calculate overall_daily_aqi ignoring ozone ('o3')
         overall_daily_aqi = []
         for i in range(7):
             daily_values = []
@@ -256,7 +257,15 @@ def predict():
                     })
 
             if daily_values:
-                highest = max(daily_values, key=lambda x: x["aqi"])
+                # Sort descending by AQI
+                daily_values_sorted = sorted(daily_values, key=lambda x: x["aqi"], reverse=True)
+                
+                # Ignore ozone ('o3') if it's the highest
+                if daily_values_sorted[0]["pollutant"] == "o3" and len(daily_values_sorted) > 1:
+                    highest = daily_values_sorted[1]
+                else:
+                    highest = daily_values_sorted[0]
+
                 overall_daily_aqi.append({
                     "day": result[TARGET_POLLUTANTS[0]][i]["day"],
                     "date": result[TARGET_POLLUTANTS[0]][i]["date"],
