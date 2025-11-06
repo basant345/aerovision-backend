@@ -9,7 +9,6 @@ import pandas as pd
 from zoneinfo import ZoneInfo   
 IST = ZoneInfo("Asia/Kolkata")
 
-
 # Disable GPU for CPU inference
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -107,11 +106,9 @@ def get_city_coordinates(city_name):
     except Exception as e:
         print("Error in get_city_coordinates:", e, flush=True)
     return None, None
-
 def fetch_pollutant_series(lat, lon, pollutant):
     try:
-        # Get current IST datetime rounded to last full hour
-        end_datetime_ist = datetime.now(IST).replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        end_datetime_ist = datetime.now(IST).replace(minute=0, second=0, microsecond=0)
         start_datetime = end_datetime_ist - timedelta(hours=71)
 
         start_date = start_datetime.date().strftime("%Y-%m-%d")
@@ -126,23 +123,28 @@ def fetch_pollutant_series(lat, lon, pollutant):
             f"&hourly={api_field}&timezone=Asia%2FKolkata"
         )
 
+        print(f"\n🌍 Fetching pollutant [{pollutant}] from URL:")
+        print(url)
+
         response = requests.get(url)
         data = response.json()
 
         values = data["hourly"].get(api_field, [])
-        time_stamps = data["hourly"].get("time", [])
 
-        valid_values = []
-        for ts, val in zip(time_stamps, values):
-            ts_dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M").replace(tzinfo=IST)
-            if ts_dt <= end_datetime_ist:
-                valid_values.append(val)
+        # ✅ Directly take last 72 values (No timestamp filtering)
+        series = values[-72:]
 
-        return valid_values[-72:]
+        print(f"✅ [{pollutant}] Values received: {len(series)} hours")
+        if len(series) > 0:
+            print(f"   Oldest value: {series[0]}")
+            print(f"   Latest value: {series[-1]}")   
+        else:
+            print(f"   ❗ No values found")
+
+        return series
     except Exception as e:
         print(f"[{pollutant.upper()}] Pollutant fetch error:", e, flush=True)
         return []
-
 
 def fetch_weather_series(lat, lon):
     try:
@@ -159,39 +161,57 @@ def fetch_weather_series(lat, lon):
 
 def predict_pollutant(pollutant, data, weather_data):
     try:
+        print(f"\n----------------------------")
+        print(f"🔮 Starting Prediction for: {pollutant.upper()}")
+        print(f"Data Length Received: {len(data)}")
+
         model = models.get(pollutant)
-        if not model or len(data) < 72: return []
+        if not model or len(data) < 72:
+            print("❗ Model missing or insufficient data.")
+            return []
 
         while len(data) < 72:
             data.insert(0, data[0])
 
         weather_features = weather_data[-1][:9] if weather_data else [0] * 9
+
         seq = [0.0] + data[-72:] + weather_features
-
-        if len(seq) != 82: return []
-
         sequence = np.array(seq).reshape((1, 82, 1))
+
+        print(f"📏 Model Sequence Shape: {sequence.shape}")
+        print(f"   Oldest value → {data[0]}")
+        print(f"   Latest value → {data[-1]}")
+        print(f"   Weather features included: {weather_features}")
+
         results = []
 
         for i in range(7):
-            val = float(abs(model.predict(sequence, verbose=0)[0, 0]))
-            aqi = get_aqi_sub_index(val, pollutant)
+            pred_val = float(abs(model.predict(sequence, verbose=0)[0, 0]))
+            print(f"   Day {i} Prediction → {pred_val}")
+
+            aqi = get_aqi_sub_index(pred_val, pollutant)
             category, warning, color = get_category_info(aqi)
+
             date = (datetime.utcnow() + timedelta(days=i)).strftime("%Y-%m-%d")
             day = "Today" if i == 0 else "Tomorrow" if i == 1 else (datetime.utcnow() + timedelta(days=i)).strftime("%d %b")
+
             results.append({
                 "day": day,
                 "date": date,
-                "value": round(val, 2),
+                "value": round(pred_val, 2),
                 "aqi": int(aqi) if not pd.isna(aqi) else 0,
                 "category": category,
                 "warning": warning,
                 "color": color
             })
-            sequence = np.roll(sequence, -1, axis=1)
-            sequence[0, -1, 0] = val
 
+            sequence = np.roll(sequence, -1, axis=1)
+            sequence[0, -1, 0] = pred_val
+
+        print(f"✅ Completed Prediction for {pollutant.upper()}")
+        print("----------------------------\n")
         return results
+
     except Exception as e:
         print(f"Prediction error for {pollutant}: {e}", flush=True)
         return []
@@ -346,3 +366,5 @@ if __name__ == "__main__":
     print("🚀 Flask server is starting...", flush=True)
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
+
