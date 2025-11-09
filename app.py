@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 from flask_cors import CORS
 from tensorflow.keras.models import load_model
 import pandas as pd
-from zoneinfo import ZoneInfo   
+from zoneinfo import ZoneInfo
+
 IST = ZoneInfo("Asia/Kolkata")
 
 # Disable GPU for CPU inference
@@ -106,16 +107,15 @@ def get_city_coordinates(city_name):
     except Exception as e:
         print("Error in get_city_coordinates:", e, flush=True)
     return None, None
+
 def fetch_pollutant_series(lat, lon, pollutant):
     try:
         end_datetime_ist = datetime.now(IST).replace(minute=0, second=0, microsecond=0)
         start_datetime = end_datetime_ist - timedelta(hours=71)
-
         start_date = start_datetime.date().strftime("%Y-%m-%d")
         end_date = end_datetime_ist.date().strftime("%Y-%m-%d")
 
         api_field = POLLUTANT_API_MAP[pollutant]
-
         url = (
             f"https://air-quality-api.open-meteo.com/v1/air-quality"
             f"?latitude={lat}&longitude={lon}"
@@ -128,19 +128,10 @@ def fetch_pollutant_series(lat, lon, pollutant):
 
         response = requests.get(url)
         data = response.json()
-
         values = data["hourly"].get(api_field, [])
-
-        # ✅ Directly take last 72 values (No timestamp filtering)
         series = values[-72:]
 
         print(f"✅ [{pollutant}] Values received: {len(series)} hours")
-        if len(series) > 0:
-            print(f"   Oldest value: {series[0]}")
-            print(f"   Latest value: {series[-1]}")   
-        else:
-            print(f"   ❗ No values found")
-
         return series
     except Exception as e:
         print(f"[{pollutant.upper()}] Pollutant fetch error:", e, flush=True)
@@ -174,20 +165,24 @@ def predict_pollutant(pollutant, data, weather_data):
             data.insert(0, data[0])
 
         weather_features = weather_data[-1][:9] if weather_data else [0] * 9
-
         seq = [0.0] + data[-72:] + weather_features
         sequence = np.array(seq).reshape((1, 82, 1))
 
         print(f"📏 Model Sequence Shape: {sequence.shape}")
-        print(f"   Oldest value → {data[0]}")
-        print(f"   Latest value → {data[-1]}")
-        print(f"   Weather features included: {weather_features}")
 
         results = []
 
         for i in range(7):
-            pred_val = float(abs(model.predict(sequence, verbose=0)[0, 0]))
-            print(f"   Day {i} Prediction → {pred_val}")
+            if i == 0:
+                # ✅ Use actual pollutant value for Day 0
+                pred_val = float(data[-1]) if data else 0.0
+                print(f"   Day 0 (Actual) Value → {pred_val}")
+            else:
+                # 🔮 Model prediction for Day 1–6
+                pred_val = float(abs(model.predict(sequence, verbose=0)[0, 0]))
+                print(f"   Day {i} (Predicted) Value → {pred_val}")
+                sequence = np.roll(sequence, -1, axis=1)
+                sequence[0, -1, 0] = pred_val
 
             aqi = get_aqi_sub_index(pred_val, pollutant)
             category, warning, color = get_category_info(aqi)
@@ -204,9 +199,6 @@ def predict_pollutant(pollutant, data, weather_data):
                 "warning": warning,
                 "color": color
             })
-
-            sequence = np.roll(sequence, -1, axis=1)
-            sequence[0, -1, 0] = pred_val
 
         print(f"✅ Completed Prediction for {pollutant.upper()}")
         print("----------------------------\n")
@@ -231,13 +223,12 @@ def predict():
         result = {}
         today_pollutants = []
 
-        # Predict all pollutants first
         for pollutant in TARGET_POLLUTANTS:
             pol_data = fetch_pollutant_series(lat, lon, pollutant)
             prediction = predict_pollutant(pollutant, pol_data, weather_data)
             result[pollutant] = prediction
 
-        # Adjust pm10 values by adding pm2_5 values
+        # Adjust pm10 values
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
 
@@ -252,7 +243,6 @@ def predict():
                 pm10_preds[i]["warning"] = warning
                 pm10_preds[i]["color"] = color
 
-        # Prepare today's pollutants list with updated pm10
         for pollutant in TARGET_POLLUTANTS:
             prediction = result.get(pollutant, [])
             if prediction:
@@ -260,7 +250,6 @@ def predict():
                 today_data["pollutant"] = pollutant
                 today_pollutants.append(today_data)
 
-        # Calculate overall_daily_aqi ignoring ozone ('o3')
         overall_daily_aqi = []
         for i in range(7):
             daily_values = []
@@ -277,10 +266,7 @@ def predict():
                     })
 
             if daily_values:
-                # Sort descending by AQI
                 daily_values_sorted = sorted(daily_values, key=lambda x: x["aqi"], reverse=True)
-                
-                # Ignore ozone ('o3') if it's the highest
                 if daily_values_sorted[0]["pollutant"] == "o3" and len(daily_values_sorted) > 1:
                     highest = daily_values_sorted[1]
                 else:
@@ -313,7 +299,7 @@ def predict():
 @app.route('/weather', methods=['POST', 'OPTIONS'])
 def weather_forecast():
     if request.method == 'OPTIONS':
-        return jsonify({"status": "OK"}), 200  # Preflight support
+        return jsonify({"status": "OK"}), 200
 
     try:
         city_name = request.json.get("city")
