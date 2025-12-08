@@ -124,7 +124,9 @@ def fetch_pollutant_series(lat, lon, pollutant):
             f"&start_date={start_date}&end_date={end_date}"
             f"&hourly={api_field}&timezone=Asia%2FKolkata"
         )
-
+        print("\n================ OPEN-METEO URL DEBUG ================")
+        print(f"URL: {url}")
+        print("=======================================================\n")
         response = requests.get(url)
         data = response.json()
         values = data["hourly"].get(api_field, [])
@@ -168,27 +170,66 @@ def fetch_weather_series(lat, lon):
     except:
         return []
 
-def predict_pollutant(pollutant, data, weather_data):
+def predict_pollutant(pollutant, data, weather_data, timestamps):
     try:
         model = models.get(pollutant)
         if not model or len(data) < 72:
             return []
 
-        while len(data) < 72:
-            data.insert(0, data[0])
-
+        # Latest weather features
         weather_features = weather_data[-1][:9] if weather_data else [0] * 9
 
+        # Prepare initial sequence for model
         seq = [0.0] + data[-72:] + weather_features
         sequence = np.array(seq).reshape((1, 82, 1))
 
         results = []
+
+        # Determine previous day date
+        today_date = datetime.now(IST).date()
+        prev_date = today_date - timedelta(days=1)
+
+        # Get indices of previous day
+        prev_day_indices = [i for i, ts in enumerate(timestamps) if datetime.fromisoformat(ts).date() == prev_date]
+
+        if not prev_day_indices:
+            print(f"No previous day data found for {prev_date}")
+            return []
+
         for i in range(7):
             pred_val = float(abs(model.predict(sequence, verbose=0)[0, 0]))
-            aqi = get_aqi_sub_index(pred_val, pollutant)
+
+            # Find current hour of previous day
+            hour_now = datetime.now(IST).hour
+            prev_hour_index = next((idx for idx in prev_day_indices if datetime.fromisoformat(timestamps[idx]).hour == hour_now), None)
+
+            if prev_hour_index is None:
+                prev_hour_index = prev_day_indices[-1]
+
+            # Take previous 23 hours from previous day
+            start_index = max(prev_hour_index - 23, 0)
+            last_23_hours = [data[j] for j in range(start_index, prev_hour_index)]
+
+            # Combine with predicted value
+            values_avg = last_23_hours + [pred_val]
+            C_avg = sum(values_avg) / len(values_avg)
+
+            # ------------------- DEBUG PRINTS -------------------
+            print("\n================ DEBUG INFO ================")
+            print(f"Pollutant: {pollutant}")
+            print(f"Predicted value for prev day same hour: {pred_val}")
+            print(f"Previous 23 Open-Meteo values (prev day): {last_23_hours}")
+            print(f"Values used for averaging: {values_avg}")
+            print(f"C_avg computed: {C_avg}")
+            print("============================================\n")
+            # -----------------------------------------------------
+
+            aqi = get_aqi_sub_index(C_avg, pollutant)
             category, warning, color = get_category_info(aqi)
+
             date = (datetime.utcnow() + timedelta(days=i)).strftime("%Y-%m-%d")
             day = "Today" if i == 0 else "Tomorrow" if i == 1 else (datetime.utcnow() + timedelta(days=i)).strftime("%d %b")
+
             results.append({
                 "day": day,
                 "date": date,
@@ -198,13 +239,18 @@ def predict_pollutant(pollutant, data, weather_data):
                 "warning": warning,
                 "color": color
             })
+
+            # Update sequence for next prediction
             sequence = np.roll(sequence, -1, axis=1)
             sequence[0, -1, 0] = pred_val
 
         return results
+
     except Exception as e:
         print(f"Prediction error for {pollutant}: {e}", flush=True)
         return []
+
+
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -223,8 +269,9 @@ def predict():
 
         for pollutant in TARGET_POLLUTANTS:
             pol_data, ts_series = fetch_pollutant_series(lat, lon, pollutant)
-            prediction = predict_pollutant(pollutant, pol_data, weather_data)
+            prediction = predict_pollutant(pollutant, pol_data, weather_data, ts_series)  # <-- pass ts_series
             result[pollutant] = prediction
+
 
         # Adjust pm10 values by adding pm2_5 values
         pm10_preds = result.get("pm10", [])
