@@ -14,14 +14,12 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True, resources={
-    r"/*": {
-        "origins": [
-            "http://localhost:8080",
-            "https://airqualitycities.iiti.ac.in"
-        ]
-    }
-})
+CORS(app, 
+     supports_credentials=True,
+     origins="*",  # Allow all origins
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+)
 
 api_key = "701cf10ad3df9b6f5f58f40bfba7e837"
 
