@@ -14,14 +14,27 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 app = Flask(__name__)
+# Allow all origins for React Native app compatibility
+# React Native doesn't send traditional browser origins
 CORS(app, 
-     supports_credentials=True,
-     origins="*",  # Allow all origins
-     allow_headers=["Content-Type", "Authorization"],
-     methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+     resources={r"/*": {
+         "origins": "*",
+         "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+         "allow_headers": ["Content-Type", "Authorization", "Accept"],
+         "expose_headers": ["Content-Type"],
+         "supports_credentials": False
+     }}
 )
 
 api_key = "701cf10ad3df9b6f5f58f40bfba7e837"
+
+# Add after_request handler to ensure CORS headers
+@app.after_request
+def after_request(response):
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
+    return response
 
 TARGET_POLLUTANTS = ["pm2_5", "pm10", "no2", "so2", "o3", "co"]
 
@@ -367,9 +380,15 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1):
         print(f"Prediction error for {pollutant}: {e}", flush=True)
         return []
 
-@app.route('/predict', methods=['POST'])
+@app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "OK"}), 200
+    
     try:
+        if not request.json:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
         city_name = request.json.get("city")
         lat, lon = get_city_coordinates(city_name)
         if not lat or not lon:
@@ -498,6 +517,9 @@ def weather_forecast():
         return jsonify({"status": "OK"}), 200
 
     try:
+        if not request.json:
+            return jsonify({"error": "No JSON data provided"}), 400
+        
         city_name = request.json.get("city")
         if not city_name:
             return jsonify({"error": "City name required"}), 400
