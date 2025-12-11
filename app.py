@@ -590,6 +590,17 @@ def weather_forecast():
         print(f"Error in /weather: {e}", flush=True)
         return jsonify({"error": "Internal server error"}), 500
 
+@app.route('/api/station/<int:station_id>', methods=['GET'])
+def proxy_station_aqi(station_id):
+    try:
+        url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
+        resp = requests.post(url, timeout=10)
+        data = resp.json()
+        return jsonify(data)
+    except Exception as e:
+        print(f"Error proxying station {station_id}: {e}", flush=True)
+        return jsonify({"error": "Failed to fetch station data"}), 500
+
 if __name__ == "__main__":
     print("🚀 Flask server is starting...", flush=True)
     port = int(os.environ.get("PORT", 5000))
