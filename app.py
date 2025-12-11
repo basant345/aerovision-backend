@@ -7,6 +7,10 @@ from flask_cors import CORS
 from tensorflow.keras.models import load_model
 import pandas as pd
 from zoneinfo import ZoneInfo
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+import time
+
 IST = ZoneInfo("Asia/Kolkata")
 
 # Disable GPU for CPU inference
@@ -132,20 +136,30 @@ def get_category_info(aqi):
             return cat, f"{cat} air quality.", color_map.get(cat, "gray")
     return "Out of Range", "AQI beyond measurable limits.", "gray"
 
-# Load models
+# Lazy load models on demand
 models = {}
-for pollutant in TARGET_POLLUTANTS:
-    try:
-        path = os.path.join(os.path.dirname(__file__), f"best_cnn_{pollutant}.keras")
-        models[pollutant] = load_model(path)
-    except Exception as e:
-        print(f"Model load error for {pollutant}: {e}", flush=True)
-        models[pollutant] = None
+models_loaded = {}
 
+def get_model(pollutant):
+    """Lazy load model when needed"""
+    if pollutant not in models_loaded:
+        try:
+            path = os.path.join(os.path.dirname(__file__), f"best_cnn_{pollutant}.keras")
+            models[pollutant] = load_model(path)
+            models_loaded[pollutant] = True
+            print(f"✅ Loaded model for {pollutant}", flush=True)
+        except Exception as e:
+            print(f"Model load error for {pollutant}: {e}", flush=True)
+            models[pollutant] = None
+            models_loaded[pollutant] = False
+    return models.get(pollutant)
+
+# Cache for geocoding results (city -> coordinates)
+@lru_cache(maxsize=100)
 def get_city_coordinates(city_name):
     try:
         url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name}&limit=1&appid={api_key}"
-        res = requests.get(url)
+        res = requests.get(url, timeout=5)
         data = res.json()
         if data and isinstance(data, list):
             item = data[0]
@@ -195,16 +209,19 @@ def get_today_data_from_envalert(city_name):
         station_ids = CITY_STATIONS[city_key]
         print(f"Found {len(station_ids)} stations for {city_key}: {station_ids}", flush=True)
         
-        # Fetch data for each station
+        # Fetch data for each station in parallel
         all_pollutant_values = {p: [] for p in TARGET_POLLUTANTS}
         all_pollutant_aqis = {p: [] for p in TARGET_POLLUTANTS}
         
-        for station_id in station_ids:
-            station_data = fetch_envalert_current_aqi(station_id)
+        # Use ThreadPoolExecutor to fetch station data concurrently
+        with ThreadPoolExecutor(max_workers=min(len(station_ids), 5)) as executor:
+            station_data_list = list(executor.map(fetch_envalert_current_aqi, station_ids))
+        
+        for station_data in station_data_list:
             if not station_data:
                 continue
             
-            print(f"Station {station_id} data: {station_data.get('station_name', 'Unknown')}", flush=True)
+            print(f"Station data: {station_data.get('station_name', 'Unknown')}", flush=True)
             
             # Extract pollutant values and their AQIs
             for pollutant in TARGET_POLLUTANTS:
@@ -268,7 +285,7 @@ def fetch_pollutant_series(lat, lon, pollutant):
             f"&start_date={start_date}&end_date={end_date}"
             f"&hourly={api_field}&timezone=Asia%2FKolkata"
         )
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         data = response.json()
         values = data["hourly"].get(api_field, [])
         timestamps = data["hourly"].get("time", [])
@@ -299,7 +316,7 @@ def fetch_weather_series(lat, lon):
         start_date = end_date - timedelta(days=4)
         weather_params = ",".join(WEATHER_COLS)
         url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly={weather_params}"
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         data = response.json()
         hourly = data["hourly"]
         return [[hourly[col][i] for col in WEATHER_COLS] for i in range(len(hourly['time']))]
@@ -312,7 +329,7 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1):
     start_day=0 for today, start_day=1 for tomorrow onwards
     """
     try:
-        model = models.get(pollutant)
+        model = get_model(pollutant)  # Use lazy loading
         if not model or len(data) < 72:
             return []
 
@@ -371,8 +388,8 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1):
             })
 
             # Update sequence for next prediction
-            sequence = np.roll(sequence, -1, axis=1)
             sequence[0, -1, 0] = pred_val
+            sequence = np.roll(sequence, -1, axis=1)
 
         return results
 
@@ -409,8 +426,15 @@ def predict():
         print(f"Using {'EnvAlert API' if use_api_data else 'Model Predictions'} for today's data")
         print(f"{'='*60}\n")
 
+        # Fetch pollutant data for all pollutants in parallel
+        def fetch_pollutant_data(pollutant):
+            return pollutant, fetch_pollutant_series(lat, lon, pollutant)
+        
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            pollutant_results = dict(executor.map(lambda p: fetch_pollutant_data(p), TARGET_POLLUTANTS))
+
         for pollutant in TARGET_POLLUTANTS:
-            pol_data, ts_series = fetch_pollutant_series(lat, lon, pollutant)
+            pol_data, ts_series = pollutant_results.get(pollutant, ([], []))
             
             if use_api_data and pollutant in envalert_today_data:
                 # Use EnvAlert API data for today
@@ -539,7 +563,7 @@ def weather_forecast():
             f"&timezone=auto&start_date={start_date}&end_date={end_date}"
         )
 
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         data = response.json()
         daily = data.get("daily", {})
 
