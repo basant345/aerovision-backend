@@ -323,6 +323,70 @@ def fetch_weather_series(lat, lon):
     except:
         return []
 
+def calculate_errors(envalert_today_data, model_predictions_for_error):
+    """
+    Calculate errors: avg of all stations - predicted by model
+    Returns errors for pm2.5 conc, pm2.5 aqi, pm10 conc, pm10 aqi, and overall aqi
+    """
+    errors = {}
+    
+    try:
+        # PM2.5 errors
+        if envalert_today_data and "pm2_5" in envalert_today_data and "pm2_5" in model_predictions_for_error:
+            api_pm25_value = envalert_today_data["pm2_5"]["value"]
+            api_pm25_aqi = envalert_today_data["pm2_5"]["aqi"]
+            model_pm25_value = model_predictions_for_error["pm2_5"]["value"]
+            model_pm25_aqi = model_predictions_for_error["pm2_5"]["aqi"]
+            
+            errors["pm2_5_concentration"] = round(api_pm25_value - model_pm25_value, 2)
+            errors["pm2_5_aqi"] = round(api_pm25_aqi - model_pm25_aqi, 2)
+            
+            print(f"PM2.5 - API: {api_pm25_value}, Model: {model_pm25_value}, Error: {errors['pm2_5_concentration']}", flush=True)
+            print(f"PM2.5 AQI - API: {api_pm25_aqi}, Model: {model_pm25_aqi}, Error: {errors['pm2_5_aqi']}", flush=True)
+        
+        # PM10 errors
+        if envalert_today_data and "pm10" in envalert_today_data and "pm10" in model_predictions_for_error:
+            api_pm10_value = envalert_today_data["pm10"]["value"]
+            api_pm10_aqi = envalert_today_data["pm10"]["aqi"]
+            model_pm10_value = model_predictions_for_error["pm10"]["value"]
+            model_pm10_aqi = model_predictions_for_error["pm10"]["aqi"]
+            
+            errors["pm10_concentration"] = round(api_pm10_value - model_pm10_value, 2)
+            errors["pm10_aqi"] = round(api_pm10_aqi - model_pm10_aqi, 2)
+            
+            print(f"PM10 - API: {api_pm10_value}, Model: {model_pm10_value}, Error: {errors['pm10_concentration']}", flush=True)
+            print(f"PM10 AQI - API: {api_pm10_aqi}, Model: {model_pm10_aqi}, Error: {errors['pm10_aqi']}", flush=True)
+        
+        # Overall AQI error - calculate from all available pollutants
+        if envalert_today_data and model_predictions_for_error:
+            # Get all AQI values from EnvAlert (excluding o3)
+            envalert_aqis = []
+            for pollutant in TARGET_POLLUTANTS:
+                if pollutant != "o3" and pollutant in envalert_today_data:
+                    envalert_aqis.append(envalert_today_data[pollutant]["aqi"])
+            
+            # Get all AQI values from model predictions (excluding o3)
+            model_aqis = []
+            for pollutant in TARGET_POLLUTANTS:
+                if pollutant != "o3" and pollutant in model_predictions_for_error:
+                    model_aqis.append(model_predictions_for_error[pollutant]["aqi"])
+            
+            if envalert_aqis and model_aqis:
+                api_overall_aqi = max(envalert_aqis)
+                model_overall_aqi = max(model_aqis)
+                errors["overall_aqi"] = round(api_overall_aqi - model_overall_aqi, 2)
+                
+                print(f"Overall AQI - API: {api_overall_aqi}, Model: {model_overall_aqi}, Error: {errors['overall_aqi']}", flush=True)
+        
+        print(f"Calculated errors: {errors}", flush=True)
+        
+    except Exception as e:
+        print(f"Error calculating errors: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+    
+    return errors
+
 def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1):
     """
     Predict pollutant values starting from a given day.
@@ -419,6 +483,7 @@ def predict():
         envalert_today_data = get_today_data_from_envalert(city_name)
         
         result = {}
+        model_predictions_for_error = {}  # Store model predictions for error calculation
         today_pollutants = []
         # Only use API data for PM2.5 and PM10
         api_pollutants = ["pm2_5", "pm10"]
@@ -441,6 +506,11 @@ def predict():
             
             # Only use API data for PM2.5 and PM10 for today
             if use_api_data and pollutant in api_pollutants and pollutant in envalert_today_data:
+                # Get model prediction for today for error calculation
+                model_pred_today = predict_pollutant(pollutant, pol_data, weather_data, ts_series, start_day=0)
+                if model_pred_today:
+                    model_predictions_for_error[pollutant] = model_pred_today[0]
+                
                 # Use EnvAlert API data for today (PM2.5 and PM10 only)
                 api_data = envalert_today_data[pollutant]
                 api_value = api_data['value']
@@ -466,6 +536,9 @@ def predict():
                 prediction = predict_pollutant(pollutant, pol_data, weather_data, ts_series, start_day=0)
                 result[pollutant] = prediction
 
+        # Calculate errors (avg of all stations - predicted by model)
+        errors = calculate_errors(envalert_today_data, model_predictions_for_error)
+
         # Adjust pm10 values by adding pm2_5 values (only for model predictions, not API data)
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
@@ -482,6 +555,33 @@ def predict():
                     pm10_preds[i]["category"] = category
                     pm10_preds[i]["warning"] = warning
                     pm10_preds[i]["color"] = color
+
+        # Add errors to future predictions (days 1-6) for PM2.5 and PM10
+        if errors:
+            # Add PM2.5 concentration error to future predictions
+            if "pm2_5_concentration" in errors and "pm2_5" in result:
+                for i in range(1, len(result["pm2_5"])):
+                    result["pm2_5"][i]["value"] = round(result["pm2_5"][i]["value"] + errors["pm2_5_concentration"], 2)
+                    # Recalculate AQI based on adjusted concentration
+                    new_aqi = get_aqi_sub_index(result["pm2_5"][i]["value"], "pm2_5")
+                    result["pm2_5"][i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
+                    category, warning, color = get_category_info(result["pm2_5"][i]["aqi"])
+                    result["pm2_5"][i]["category"] = category
+                    result["pm2_5"][i]["warning"] = warning
+                    result["pm2_5"][i]["color"] = color
+            
+            # Add PM10 concentration error to future predictions
+            if "pm10_concentration" in errors and "pm10" in result:
+                for i in range(1, len(result["pm10"])):
+                    result["pm10"][i]["value"] = round(result["pm10"][i]["value"] + errors["pm10_concentration"], 2)
+                    # Recalculate AQI based on adjusted concentration
+                    new_aqi = get_aqi_sub_index(result["pm10"][i]["value"], "pm10")
+                    result["pm10"][i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
+                    category, warning, color = get_category_info(result["pm10"][i]["aqi"])
+                    result["pm10"][i]["category"] = category
+                    result["pm10"][i]["warning"] = warning
+                    result["pm10"][i]["color"] = color
+
 
         # Prepare today's pollutants list
         for pollutant in TARGET_POLLUTANTS:
@@ -528,6 +628,7 @@ def predict():
             "predictions": result,
             "today_pollutants": today_pollutants,
             "overall_daily_aqi": overall_daily_aqi,
+            "errors": errors,
             "lat": lat,
             "lon": lon,
             "data_source": {
