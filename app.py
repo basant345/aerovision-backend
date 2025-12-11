@@ -420,10 +420,13 @@ def predict():
         
         result = {}
         today_pollutants = []
+        # Only use API data for PM2.5 and PM10
+        api_pollutants = ["pm2_5", "pm10"]
         use_api_data = envalert_today_data is not None
 
         print(f"\n{'='*60}")
-        print(f"Using {'EnvAlert API' if use_api_data else 'Model Predictions'} for today's data")
+        print(f"Using EnvAlert API for PM2.5 and PM10 (today)")
+        print(f"Using Model Predictions for CO, NO2, O3, SO2 (all days)")
         print(f"{'='*60}\n")
 
         # Fetch pollutant data for all pollutants in parallel
@@ -436,8 +439,9 @@ def predict():
         for pollutant in TARGET_POLLUTANTS:
             pol_data, ts_series = pollutant_results.get(pollutant, ([], []))
             
-            if use_api_data and pollutant in envalert_today_data:
-                # Use EnvAlert API data for today
+            # Only use API data for PM2.5 and PM10 for today
+            if use_api_data and pollutant in api_pollutants and pollutant in envalert_today_data:
+                # Use EnvAlert API data for today (PM2.5 and PM10 only)
                 api_data = envalert_today_data[pollutant]
                 api_value = api_data['value']
                 api_aqi = api_data['aqi']
@@ -458,7 +462,7 @@ def predict():
                 future_predictions = predict_pollutant(pollutant, pol_data, weather_data, ts_series, start_day=1)
                 result[pollutant] = [today_data] + future_predictions
             else:
-                # Use model predictions for all days including today
+                # Use model predictions for all days including today (CO, NO2, O3, SO2)
                 prediction = predict_pollutant(pollutant, pol_data, weather_data, ts_series, start_day=0)
                 result[pollutant] = prediction
 
@@ -467,9 +471,9 @@ def predict():
         pm25_preds = result.get("pm2_5", [])
         if pm10_preds and pm25_preds:
             for i in range(min(len(pm10_preds), len(pm25_preds))):
-                # For EnvAlert API data, PM10 already includes PM2.5
-                # Only add if using model predictions (i.e., not day 0 when using API data)
-                if not (use_api_data and i == 0 and "pm10" in envalert_today_data):
+                # For EnvAlert API data (day 0 only), PM10 already includes PM2.5
+                # Only add PM2.5 to PM10 if using model predictions
+                if not (use_api_data and i == 0 and "pm10" in envalert_today_data and "pm2_5" in envalert_today_data):
                     combined_value = pm10_preds[i]["value"] + pm25_preds[i]["value"]
                     pm10_preds[i]["value"] = round(combined_value, 2)
                     new_aqi = get_aqi_sub_index(combined_value, "pm10")
@@ -526,7 +530,14 @@ def predict():
             "overall_daily_aqi": overall_daily_aqi,
             "lat": lat,
             "lon": lon,
-            "data_source": "EnvAlert API" if use_api_data else "Model Predictions"
+            "data_source": {
+                "pm2_5": "EnvAlert API (today)" if (use_api_data and "pm2_5" in envalert_today_data) else "Model Predictions",
+                "pm10": "EnvAlert API (today)" if (use_api_data and "pm10" in envalert_today_data) else "Model Predictions",
+                "co": "Model Predictions",
+                "no2": "Model Predictions",
+                "o3": "Model Predictions",
+                "so2": "Model Predictions"
+            }
         }
         
         return jsonify(response_data)
