@@ -113,6 +113,94 @@ AQI_CATEGORIES = {
     (401, 500): 'Severe'
 }
 
+
+# new added
+from math import radians, cos, sin, asin, sqrt
+
+def haversine(lat1, lon1, lat2, lon2):
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * asin(sqrt(a))
+    return 6371 * c  # km
+
+
+
+# new added
+@lru_cache(maxsize=100)
+def get_city_latlon(city):
+    return get_city_coordinates(city)
+
+def find_nearest_city(city_name):
+    base_lat, base_lon = get_city_coordinates(city_name)
+    if not base_lat:
+        return None
+
+    nearest_city = None
+    min_dist = float("inf")
+
+    for city in CITY_STATIONS.keys():
+        if city.lower() == city_name.lower():
+            continue
+
+        lat, lon = get_city_latlon(city)
+        if not lat:
+            continue
+
+        dist = haversine(base_lat, base_lon, lat, lon)
+        if dist < min_dist:
+            min_dist = dist
+            nearest_city = city
+
+    return nearest_city
+
+# new added
+def get_fallback_data_from_nearest_city(city_name):
+    nearest_city = find_nearest_city(city_name)
+
+    if not nearest_city:
+        print("❌ No nearest city found", flush=True)
+        return None
+
+    print(f"⚠ Using fallback city: {nearest_city}", flush=True)
+
+    station_ids = CITY_STATIONS[nearest_city][:2]  # only 2 stations
+
+    pollutant_values = {p: [] for p in TARGET_POLLUTANTS}
+    pollutant_aqis = {p: [] for p in TARGET_POLLUTANTS}
+
+    for station_id in station_ids:
+        data = fetch_envalert_current_aqi(station_id)
+        if not data:
+            continue
+
+        for pollutant in TARGET_POLLUTANTS:
+            value_key, aqi_key = ENVALERT_POLLUTANT_MAP[pollutant]
+
+            try:
+                val = float(data.get(value_key))
+                pollutant_values[pollutant].append(val)
+            except:
+                pass
+
+            try:
+                aqi = float(data.get(aqi_key))
+                pollutant_aqis[pollutant].append(aqi)
+            except:
+                pass
+
+    result = {}
+    for p in TARGET_POLLUTANTS:
+        if pollutant_values[p]:
+            result[p] = {
+                "value": round(sum(pollutant_values[p]) / len(pollutant_values[p]), 2),
+                "aqi": round(sum(pollutant_aqis[p]) / len(pollutant_aqis[p]), 0)
+            }
+
+    return result if result else None
+
+
 def get_aqi_sub_index(C, pollutant):
     if pd.isna(C): return np.nan
     breakpoints = AQI_BREAKPOINTS.get(pollutant)
@@ -461,157 +549,168 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1):
         print(f"Prediction error for {pollutant}: {e}", flush=True)
         return []
 
+
+def getAvgOfAllStationsValues():
+    url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
+    try:
+        resp = requests.post(url, timeout=10)
+        resp.raise_for_status()
+        stations = resp.json()
+
+        if not isinstance(stations, list):
+            raise ValueError("Unexpected API response format")
+
+        pm25_values = []
+        pm10_values = []
+
+        for station in stations:
+            # PM2.5
+            pm25 = station.get("pm25")
+            if pm25 not in (None, "", "ID"):
+                try:
+                    pm25_values.append(float(pm25))
+                except ValueError:
+                    pass
+
+            # PM10
+            pm10 = station.get("pm10")
+            if pm10 not in (None, "", "ID"):
+                try:
+                    pm10_values.append(float(pm10))
+                except ValueError:
+                    pass
+
+        return {
+            "pm25_avg": round(sum(pm25_values) / len(pm25_values), 2) if pm25_values else None,
+            "pm10_avg": round(sum(pm10_values) / len(pm10_values), 2) if pm10_values else None,
+            "pm25_stations": len(pm25_values),
+            "pm10_stations": len(pm10_values),
+            "total_stations": len(stations)
+        }
+
+    except Exception as e:
+        print(f"Error fetching all stations current AQI: {e}", flush=True)
+        return None
+
+
 @app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
     if request.method == 'OPTIONS':
         return jsonify({"status": "OK"}), 200
-    
+
     try:
         if not request.json:
             return jsonify({"error": "No JSON data provided"}), 400
-        
+
         city_name = request.json.get("city")
         lat, lon = get_city_coordinates(city_name)
         if not lat or not lon:
             return jsonify({"error": "Invalid city"}), 400
 
+        # 🌦 Weather data
         weather_data = fetch_weather_series(lat, lon)
         if not weather_data:
             return jsonify({"error": "Weather fetch failed"}), 400
 
-        # Try to get today's data from EnvAlert API
+        # ✅ EnvAlert (PRIMARY → city stations)
         envalert_today_data = get_today_data_from_envalert(city_name)
-        
+        env_source = "city"
+
+        # 🔁 FALLBACK → nearest city (2 stations)
+        if not envalert_today_data:
+            envalert_today_data = get_fallback_data_from_nearest_city(city_name)
+            env_source = "nearest_city_fallback"
+
         result = {}
-        model_predictions_for_error = {}  # Store model predictions for error calculation
+        model_predictions_for_error = {}
         today_pollutants = []
-        # Only use API data for PM2.5 and PM10
-        api_pollutants = ["pm2_5", "pm10"]
-        use_api_data = envalert_today_data is not None
 
-        print(f"\n{'='*60}")
-        print(f"Using EnvAlert API for PM2.5 and PM10 (today)")
-        print(f"Using Model Predictions for CO, NO2, O3, SO2 (all days)")
-        print(f"{'='*60}\n")
-
-        # Fetch pollutant data for all pollutants in parallel
+        # ⚡ Fetch pollutant series in parallel
         def fetch_pollutant_data(pollutant):
             return pollutant, fetch_pollutant_series(lat, lon, pollutant)
-        
-        with ThreadPoolExecutor(max_workers=6) as executor:
-            pollutant_results = dict(executor.map(lambda p: fetch_pollutant_data(p), TARGET_POLLUTANTS))
 
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            pollutant_results = dict(executor.map(fetch_pollutant_data, TARGET_POLLUTANTS))
+
+        # 🔮 MODEL predictions (TODAY INCLUDED)
         for pollutant in TARGET_POLLUTANTS:
             pol_data, ts_series = pollutant_results.get(pollutant, ([], []))
-            
-            # Only use API data for PM2.5 and PM10 for today
-            if use_api_data and pollutant in api_pollutants and pollutant in envalert_today_data:
-                # Get model prediction for today for error calculation
-                model_pred_today = predict_pollutant(pollutant, pol_data, weather_data, ts_series, start_day=0)
-                if model_pred_today:
-                    model_predictions_for_error[pollutant] = model_pred_today[0]
-                
-                # Use EnvAlert API data for today (PM2.5 and PM10 only)
-                api_data = envalert_today_data[pollutant]
-                api_value = api_data['value']
-                api_aqi = api_data['aqi']
-                
-                category, warning, color = get_category_info(api_aqi)
-                
-                today_data = {
-                    "day": "Today",
-                    "date": datetime.utcnow().strftime("%Y-%m-%d"),
-                    "value": round(api_value, 2),
-                    "aqi": int(api_aqi),
-                    "category": category,
-                    "warning": warning,
-                    "color": color
-                }
-                
-                # Get predictions for tomorrow onwards (start_day=1)
-                future_predictions = predict_pollutant(pollutant, pol_data, weather_data, ts_series, start_day=1)
-                result[pollutant] = [today_data] + future_predictions
-            else:
-                # Use model predictions for all days including today (CO, NO2, O3, SO2)
-                prediction = predict_pollutant(pollutant, pol_data, weather_data, ts_series, start_day=0)
-                result[pollutant] = prediction
 
-        # Calculate errors (avg of all stations - predicted by model)
+            prediction = predict_pollutant(
+                pollutant,
+                pol_data,
+                weather_data,
+                ts_series,
+                start_day=0
+            )
+
+            result[pollutant] = prediction
+
+            # Store TODAY model prediction for error calc
+            if prediction:
+                model_predictions_for_error[pollutant] = prediction[0]
+
+        # 🧮 Error calculation (EnvAlert vs Model)
         errors = calculate_errors(envalert_today_data, model_predictions_for_error)
 
-        # Adjust pm10 values by adding pm2_5 values (only for model predictions, not API data)
+        # ➕ Apply error correction (PM2.5 & PM10) → TODAY + FUTURE
+        for pollutant in ["pm2_5", "pm10"]:
+            error_key = f"{pollutant}_concentration"
+            if error_key in errors and pollutant in result:
+                for i in range(len(result[pollutant])):
+                    result[pollutant][i]["value"] = round(
+                        result[pollutant][i]["value"] + errors[error_key], 2
+                    )
+
+                    new_aqi = get_aqi_sub_index(result[pollutant][i]["value"], pollutant)
+                    result[pollutant][i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
+
+                    category, warning, color = get_category_info(result[pollutant][i]["aqi"])
+                    result[pollutant][i]["category"] = category
+                    result[pollutant][i]["warning"] = warning
+                    result[pollutant][i]["color"] = color
+
+        # ➕ PM10 = PM10 + PM2.5 (MODEL BASED)
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
+
         if pm10_preds and pm25_preds:
             for i in range(min(len(pm10_preds), len(pm25_preds))):
-                # For EnvAlert API data (day 0 only), PM10 already includes PM2.5
-                # Only add PM2.5 to PM10 if using model predictions
-                if not (use_api_data and i == 0 and "pm10" in envalert_today_data and "pm2_5" in envalert_today_data):
-                    combined_value = pm10_preds[i]["value"] + pm25_preds[i]["value"]
-                    pm10_preds[i]["value"] = round(combined_value, 2)
-                    new_aqi = get_aqi_sub_index(combined_value, "pm10")
-                    pm10_preds[i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
-                    category, warning, color = get_category_info(pm10_preds[i]["aqi"])
-                    pm10_preds[i]["category"] = category
-                    pm10_preds[i]["warning"] = warning
-                    pm10_preds[i]["color"] = color
+                combined_value = pm10_preds[i]["value"] + pm25_preds[i]["value"]
+                pm10_preds[i]["value"] = round(combined_value, 2)
 
-        # Add errors to future predictions (days 1-6) for PM2.5 and PM10
-        if errors:
-            # Add PM2.5 concentration error to future predictions
-            if "pm2_5_concentration" in errors and "pm2_5" in result:
-                for i in range(1, len(result["pm2_5"])):
-                    result["pm2_5"][i]["value"] = round(result["pm2_5"][i]["value"] + errors["pm2_5_concentration"], 2)
-                    # Recalculate AQI based on adjusted concentration
-                    new_aqi = get_aqi_sub_index(result["pm2_5"][i]["value"], "pm2_5")
-                    result["pm2_5"][i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
-                    category, warning, color = get_category_info(result["pm2_5"][i]["aqi"])
-                    result["pm2_5"][i]["category"] = category
-                    result["pm2_5"][i]["warning"] = warning
-                    result["pm2_5"][i]["color"] = color
-            
-            # Add PM10 concentration error to future predictions
-            if "pm10_concentration" in errors and "pm10" in result:
-                for i in range(1, len(result["pm10"])):
-                    result["pm10"][i]["value"] = round(result["pm10"][i]["value"] + errors["pm10_concentration"], 2)
-                    # Recalculate AQI based on adjusted concentration
-                    new_aqi = get_aqi_sub_index(result["pm10"][i]["value"], "pm10")
-                    result["pm10"][i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
-                    category, warning, color = get_category_info(result["pm10"][i]["aqi"])
-                    result["pm10"][i]["category"] = category
-                    result["pm10"][i]["warning"] = warning
-                    result["pm10"][i]["color"] = color
+                new_aqi = get_aqi_sub_index(combined_value, "pm10")
+                pm10_preds[i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
 
+                category, warning, color = get_category_info(pm10_preds[i]["aqi"])
+                pm10_preds[i]["category"] = category
+                pm10_preds[i]["warning"] = warning
+                pm10_preds[i]["color"] = color
 
-        # Prepare today's pollutants list
+        # 📅 Today's pollutants
         for pollutant in TARGET_POLLUTANTS:
-            prediction = result.get(pollutant, [])
-            if prediction:
-                today_data = prediction[0].copy()
+            if result.get(pollutant):
+                today_data = result[pollutant][0].copy()
                 today_data["pollutant"] = pollutant
                 today_pollutants.append(today_data)
 
-        # Calculate overall_daily_aqi ignoring ozone ('o3')
+        # 🌍 Overall AQI (excluding O3)
         overall_daily_aqi = []
         for i in range(7):
             daily_values = []
             for p in TARGET_POLLUTANTS:
-                pollutant_data = result.get(p, [])
-                if len(pollutant_data) > i:
+                if p != "o3" and len(result.get(p, [])) > i:
                     daily_values.append({
                         "pollutant": p,
-                        "aqi": pollutant_data[i]["aqi"],
-                        "value": pollutant_data[i]["value"],
-                        "category": pollutant_data[i]["category"],
-                        "warning": pollutant_data[i]["warning"],
-                        "color": pollutant_data[i]["color"]
+                        "aqi": result[p][i]["aqi"],
+                        "value": result[p][i]["value"],
+                        "category": result[p][i]["category"],
+                        "warning": result[p][i]["warning"],
+                        "color": result[p][i]["color"]
                     })
+
             if daily_values:
-                daily_values_sorted = sorted(daily_values, key=lambda x: x["aqi"], reverse=True)
-                if daily_values_sorted[0]["pollutant"] == "o3" and len(daily_values_sorted) > 1:
-                    highest = daily_values_sorted[1]
-                else:
-                    highest = daily_values_sorted[0]
+                highest = max(daily_values, key=lambda x: x["aqi"])
                 overall_daily_aqi.append({
                     "day": result[TARGET_POLLUTANTS[0]][i]["day"],
                     "date": result[TARGET_POLLUTANTS[0]][i]["date"],
@@ -623,29 +722,21 @@ def predict():
                     "color": highest["color"]
                 })
 
-        response_data = {
+        return jsonify({
             "city": city_name,
             "predictions": result,
             "today_pollutants": today_pollutants,
             "overall_daily_aqi": overall_daily_aqi,
             "errors": errors,
+            "env_source": env_source,   # 🔥 city / nearest_city_fallback
             "lat": lat,
-            "lon": lon,
-            "data_source": {
-                "pm2_5": "EnvAlert API (today)" if (use_api_data and "pm2_5" in envalert_today_data) else "Model Predictions",
-                "pm10": "EnvAlert API (today)" if (use_api_data and "pm10" in envalert_today_data) else "Model Predictions",
-                "co": "Model Predictions",
-                "no2": "Model Predictions",
-                "o3": "Model Predictions",
-                "so2": "Model Predictions"
-            }
-        }
-        
-        return jsonify(response_data)
+            "lon": lon
+        })
 
     except Exception as e:
         print(f"Error in /predict: {e}", flush=True)
         return jsonify({"error": "Internal Server Error"}), 500
+
 
 @app.route('/weather', methods=['POST', 'OPTIONS'])
 def weather_forecast():
@@ -712,6 +803,16 @@ def proxy_station_aqi(station_id):
     except Exception as e:
         print(f"Error proxying station {station_id}: {e}", flush=True)
         return jsonify({"error": "Failed to fetch station data"}), 500
+
+@app.route('/api/get_average', methods=['GET'])
+def get_average():
+    data = getAvgOfAllStationsValues()
+
+    if data is None:
+        return jsonify({"error": "Failed to fetch average AQI data"}), 500
+
+    return jsonify(data)
+
 
 if __name__ == "__main__":
     print("🚀 Flask server is starting...", flush=True)
