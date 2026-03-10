@@ -596,7 +596,11 @@ def getAvgOfAllStationsValues():
 @app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
     if request.method == 'OPTIONS':
-        return jsonify({"status": "OK"}), 200
+        response = jsonify({"status": "OK"})
+        response.headers.add('Access-Control-Allow-Origin', '*')
+        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
+        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        return response, 200
 
     try:
         if not request.json:
