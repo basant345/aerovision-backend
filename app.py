@@ -942,7 +942,7 @@ def debug_stations():
     """Debug endpoint — shows raw EnvAlert API response for first 3 stations"""
     try:
         url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
-        resp = requests.post(url, timeout=15)
+        resp = requests.post(url, timeout=30)
         data = resp.json()
         if isinstance(data, list) and len(data) > 0:
             return jsonify({
@@ -962,7 +962,7 @@ def all_stations_aqi():
         return jsonify({"status": "OK"}), 200
     try:
         url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
-        resp = requests.post(url, timeout=15)
+        resp = requests.post(url, timeout=30)
         resp.raise_for_status()
         stations = resp.json()
         if not isinstance(stations, list):
@@ -995,7 +995,7 @@ def mp_ranking():
 
         # ── 1. Fetch ALL station data ──────────────────────────────
         url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
-        resp = requests.post(url, timeout=15)
+        resp = requests.post(url, timeout=30)
         resp.raise_for_status()
         stations = resp.json()
 
