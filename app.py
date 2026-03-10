@@ -797,7 +797,12 @@ def weather_forecast():
 def proxy_station_aqi(station_id):
     try:
         url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
-        resp = requests.post(url, timeout=10)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://erc.mp.gov.in/",
+            "Accept": "application/json"
+        }
+        resp = requests.post(url, headers=headers, timeout=15)
         data = resp.json()
         return jsonify(data)
     except Exception as e:
@@ -812,6 +817,298 @@ def get_average():
         return jsonify({"error": "Failed to fetch average AQI data"}), 500
 
     return jsonify(data)
+
+
+
+@app.route('/predict_grid', methods=['POST', 'OPTIONS'])
+def predict_grid():
+    """
+    Accepts a city name + grid_size, generates a grid of lat/lon points
+    around the city, runs CNN models for each point, returns predicted
+    AQI per point. Used by frontend to build a model-driven IDW heatmap.
+    """
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "OK"}), 200
+
+    try:
+        if not request.json:
+            return jsonify({"error": "No JSON data provided"}), 400
+
+        city_name = request.json.get("city")
+        grid_size = int(request.json.get("grid_size", 3))   # 3x3 = 9 points (fast)
+        radius_deg = float(request.json.get("radius_deg", 0.3))  # ~33km radius
+
+        if not city_name:
+            return jsonify({"error": "city is required"}), 400
+
+        # Get city center coordinates
+        center_lat, center_lon = get_city_coordinates(city_name)
+        if not center_lat or not center_lon:
+            return jsonify({"error": f"Could not find coordinates for {city_name}"}), 400
+
+        print(f"🗺️ predict_grid: {city_name} ({center_lat},{center_lon}) grid={grid_size}x{grid_size}", flush=True)
+
+        # Generate evenly spaced grid of points around city center
+        points = []
+        step = (radius_deg * 2) / (grid_size - 1) if grid_size > 1 else 0
+        for i in range(grid_size):
+            for j in range(grid_size):
+                pt_lat = round(center_lat - radius_deg + i * step, 4)
+                pt_lon = round(center_lon - radius_deg + j * step, 4)
+                points.append({"lat": pt_lat, "lon": pt_lon})
+
+        print(f"📍 Generated {len(points)} grid points", flush=True)
+
+        def predict_aqi_for_point(point):
+            pt_lat = point["lat"]
+            pt_lon = point["lon"]
+            try:
+                # Fetch weather data for this point
+                weather_data = fetch_weather_series(pt_lat, pt_lon)
+                if not weather_data:
+                    return {"lat": pt_lat, "lon": pt_lon, "aqi": None, "error": "no_weather"}
+
+                # Fetch all 6 pollutant series in parallel
+                def fetch_pol(pollutant):
+                    return pollutant, fetch_pollutant_series(pt_lat, pt_lon, pollutant)
+
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    pol_results = dict(ex.map(fetch_pol, TARGET_POLLUTANTS))
+
+                # Run CNN model for each pollutant, collect today's AQI
+                daily_aqis = []
+                pollutant_details = {}
+
+                for pollutant in TARGET_POLLUTANTS:
+                    if pollutant == "o3":
+                        continue  # exclude o3 from overall AQI (matches /predict logic)
+
+                    pol_data, ts_series = pol_results.get(pollutant, ([], []))
+                    prediction = predict_pollutant(
+                        pollutant, pol_data, weather_data, ts_series, start_day=0
+                    )
+
+                    if prediction and len(prediction) > 0:
+                        today_aqi = prediction[0]["aqi"]
+                        daily_aqis.append(today_aqi)
+                        pollutant_details[pollutant] = {
+                            "aqi": today_aqi,
+                            "value": prediction[0]["value"],
+                            "category": prediction[0]["category"]
+                        }
+
+                if not daily_aqis:
+                    return {"lat": pt_lat, "lon": pt_lon, "aqi": None, "error": "no_predictions"}
+
+                # Overall AQI = max across pollutants (same as /predict endpoint)
+                overall_aqi = max(daily_aqis)
+                print(f"  ✅ ({pt_lat},{pt_lon}) → AQI={overall_aqi}", flush=True)
+
+                return {
+                    "lat": pt_lat,
+                    "lon": pt_lon,
+                    "aqi": overall_aqi,
+                    "pollutants": pollutant_details
+                }
+
+            except Exception as e:
+                print(f"  ❌ Error for ({pt_lat},{pt_lon}): {e}", flush=True)
+                return {"lat": pt_lat, "lon": pt_lon, "aqi": None, "error": str(e)}
+
+        # Process all grid points in parallel (max 5 at once to avoid overload)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            results = list(executor.map(predict_aqi_for_point, points))
+
+        valid_results = [r for r in results if r.get("aqi") is not None]
+        failed_count = len(results) - len(valid_results)
+
+        print(f"✅ predict_grid done: {len(valid_results)} valid, {failed_count} failed", flush=True)
+
+        return jsonify({
+            "city": city_name,
+            "center": {"lat": center_lat, "lon": center_lon},
+            "grid_size": grid_size,
+            "total_points": len(points),
+            "valid_points": len(valid_results),
+            "grid": valid_results
+        })
+
+    except Exception as e:
+        print(f"Error in /predict_grid: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route('/debug_stations', methods=['GET'])
+def debug_stations():
+    """Debug endpoint — shows raw EnvAlert API response for first 3 stations"""
+    try:
+        url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
+        resp = requests.post(url, timeout=15)
+        data = resp.json()
+        if isinstance(data, list) and len(data) > 0:
+            return jsonify({
+                "total": len(data),
+                "sample_keys": list(data[0].keys()),
+                "first_3": data[:3]
+            })
+        return jsonify({"raw": str(data)[:500]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/all_stations_aqi", methods=["GET", "OPTIONS"])
+def all_stations_aqi():
+    """Returns individual AQI for every station: {station_id: aqi}"""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "OK"}), 200
+    try:
+        url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
+        resp = requests.post(url, timeout=15)
+        resp.raise_for_status()
+        stations = resp.json()
+        if not isinstance(stations, list):
+            return jsonify({"error": "Unexpected response"}), 500
+        result = {}
+        for station in stations:
+            sid = station.get("station_id")
+            aqi_raw = station.get("aqi") or station.get("AQI")
+            if sid is None or aqi_raw in (None, "", "null", "NULL", "ID"):
+                continue
+            try:
+                aqi_val = float(str(aqi_raw).strip())
+                if 0 < aqi_val <= 500:
+                    result[int(sid)] = round(aqi_val)
+            except (ValueError, TypeError):
+                continue
+        return jsonify(result)
+    except Exception as e:
+        print(f"[all_stations_aqi] Error: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/mp_ranking', methods=['POST', 'OPTIONS'])
+def mp_ranking():
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "OK"}), 200
+
+    try:
+        city_name = (request.json or {}).get("city", "").strip()
+
+        # ── 1. Fetch ALL station data ──────────────────────────────
+        url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
+        resp = requests.post(url, timeout=15)
+        resp.raise_for_status()
+        stations = resp.json()
+
+        if not isinstance(stations, list) or len(stations) == 0:
+            return jsonify({"error": "No station data available"}), 500
+
+        print(f"[mp_ranking] Got {len(stations)} stations. Sample keys: {list(stations[0].keys())}", flush=True)
+
+        # ── 2. Reverse map: station_id (int) → city name ───────────
+        station_to_city = {}
+        for cname, ids in CITY_STATIONS.items():
+            for sid in ids:
+                station_to_city[int(sid)] = cname
+
+        # ── 3. Parse each station → get AQI ────────────────────────
+        city_aqi_map = {}  # city → list of aqi values
+
+        for station in stations:
+            # Get station_id — could be int or string
+            sid_raw = station.get("station_id")
+            try:
+                sid = int(str(sid_raw).strip())
+            except (ValueError, TypeError):
+                continue
+
+            # Get AQI — try multiple field names, API returns string "177"
+            aqi_raw = None
+            for field in ["aqi", "AQI", "overall_aqi", "pm25_subindex", "pm10_subindex"]:
+                val = station.get(field)
+                if val not in (None, "", "null", "NULL", "ID", "N/A"):
+                    aqi_raw = val
+                    break
+
+            # If no aqi field, calculate from pm25 using our breakpoints
+            if aqi_raw is None:
+                pm25_raw = station.get("pm25") or station.get("PM25") or station.get("pm2_5")
+                if pm25_raw not in (None, "", "null", "ID"):
+                    try:
+                        pm25_val = float(str(pm25_raw).strip())
+                        aqi_raw = get_aqi_sub_index(pm25_val, "pm2_5")
+                    except:
+                        pass
+
+            if aqi_raw is None:
+                continue
+
+            try:
+                aqi_val = float(str(aqi_raw).strip())
+                if aqi_val <= 0 or aqi_val > 500:
+                    continue
+            except (ValueError, TypeError):
+                continue
+
+            # Match station to city
+            city = station_to_city.get(sid)
+
+            # Fallback: match by station_name string
+            if not city:
+                sname = str(station.get("station_name", "") or station.get("name", "")).lower()
+                for cname in CITY_STATIONS:
+                    if cname.lower() in sname:
+                        city = cname
+                        break
+
+            if city:
+                city_aqi_map.setdefault(city, []).append(aqi_val)
+                print(f"[mp_ranking] Station {sid} → {city}: AQI={aqi_val}", flush=True)
+
+        print(f"[mp_ranking] Cities mapped: {list(city_aqi_map.keys())}", flush=True)
+
+        if not city_aqi_map:
+            return jsonify({"error": "Could not map any stations to cities. Check station IDs."}), 500
+
+        # ── 4. Average AQI per city, sort highest → lowest ─────────
+        city_rankings = []
+        for cname, aqis in city_aqi_map.items():
+            avg_aqi = round(sum(aqis) / len(aqis))
+            category, _, color = get_category_info(avg_aqi)
+            city_rankings.append({
+                "city": cname,
+                "aqi": avg_aqi,
+                "category": category,
+                "color": color,
+                "station_count": len(aqis),
+            })
+
+        city_rankings.sort(key=lambda x: x["aqi"], reverse=True)
+        for i, entry in enumerate(city_rankings):
+            entry["rank"] = i + 1
+
+        # ── 5. Find rank of requested city ─────────────────────────
+        target_entry = next(
+            (e for e in city_rankings if e["city"].lower() == city_name.lower()),
+            None
+        )
+
+        return jsonify({
+            "city": city_name,
+            "rank": target_entry["rank"] if target_entry else None,
+            "total_cities": len(city_rankings),
+            "aqi": target_entry["aqi"] if target_entry else None,
+            "category": target_entry["category"] if target_entry else None,
+            "color": target_entry["color"] if target_entry else None,
+            "all_rankings": city_rankings,
+        })
+
+    except Exception as e:
+        print(f"[mp_ranking] Error: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
