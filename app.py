@@ -33,12 +33,6 @@ CORS(app,
 api_key = "701cf10ad3df9b6f5f58f40bfba7e837"
 
 # Add after_request handler to ensure CORS headers
-@app.after_request
-def after_request(response):
-    response.headers.add('Access-Control-Allow-Origin', '*')
-    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept')
-    response.headers.add('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS')
-    return response
 
 TARGET_POLLUTANTS = ["pm2_5", "pm10", "no2", "so2", "o3", "co"]
 
