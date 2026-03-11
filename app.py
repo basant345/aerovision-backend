@@ -22,7 +22,7 @@ app = Flask(__name__)
 # React Native doesn't send traditional browser origins
 CORS(app, 
      resources={r"/*": {
-         "origins": "*",
+         "origins": ["https://airqualitycities.iiti.ac.in", "http://localhost:8080"],
          "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
          "allow_headers": ["Content-Type", "Authorization", "Accept"],
          "expose_headers": ["Content-Type"],
