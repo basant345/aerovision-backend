@@ -602,7 +602,7 @@ def predict():
 
         city_name = request.json.get("city")
         lat, lon = get_city_coordinates(city_name)
-        if not lat or not lon:
+        if lat is None or lon is None:
             return jsonify({"error": "Invalid city"}), 400
 
         # 🌦 Weather data
@@ -750,7 +750,7 @@ def weather_forecast():
             return jsonify({"error": "City name required"}), 400
 
         lat, lon = get_city_coordinates(city_name)
-        if not lat or not lon:
+        if lat is None or lon is None:
             return jsonify({"error": "City not found"}), 404
 
         today = datetime.utcnow().date()
@@ -805,7 +805,7 @@ def proxy_station_aqi(station_id):
         return jsonify(data)
     except Exception as e:
         print(f"Error proxying station {station_id}: {e}", flush=True)
-        return jsonify({"error": "Failed to fetch station data"}), 500
+        return jsonify([]), 200  # Return empty array so frontend doesn't crash
 
 @app.route('/api/get_average', methods=['GET'])
 def get_average():
@@ -1106,6 +1106,80 @@ def mp_ranking():
         print(f"[mp_ranking] Error: {e}", flush=True)
         import traceback
         traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/monthly_average', methods=['POST', 'OPTIONS'])
+def monthly_average():
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "OK"}), 200
+    try:
+        data = request.get_json()
+        city_name = data.get("city", "").strip()
+
+        lat, lon = get_city_coordinates(city_name)
+        if lat is None or lon is None:
+            return jsonify({"error": f"City '{city_name}' not found"}), 404
+
+        end_date = datetime.now(IST).date()
+        start_date = end_date - timedelta(days=29)
+
+        results = {}
+        for pollutant, api_field in POLLUTANT_API_MAP.items():
+            url = (
+                f"https://air-quality-api.open-meteo.com/v1/air-quality"
+                f"?latitude={lat}&longitude={lon}"
+                f"&start_date={start_date}&end_date={end_date}"
+                f"&hourly={api_field}&timezone=Asia%2FKolkata"
+            )
+            try:
+                resp = requests.get(url, timeout=15)
+                d = resp.json()
+                hourly_values = d["hourly"].get(api_field, [])
+                hourly_times  = d["hourly"].get("time", [])
+
+                # Group by date and compute daily average
+                daily = {}
+                for ts, val in zip(hourly_times, hourly_values):
+                    if val is None:
+                        continue
+                    date_str = ts[:10]
+                    daily.setdefault(date_str, []).append(val)
+
+                results[pollutant] = [
+                    {"date": date, "avg": round(sum(vals) / len(vals), 2)}
+                    for date, vals in sorted(daily.items())
+                ]
+            except Exception as e:
+                print(f"[monthly_average] {pollutant} error: {e}", flush=True)
+                results[pollutant] = []
+
+        # Compute daily overall AQI from pm2_5 daily averages
+        aqi_series = []
+        for entry in results.get("pm2_5", []):
+            try:
+                avg_val = entry.get("avg")
+                if avg_val is None:
+                    aqi_series.append({"date": entry["date"], "avg": None})
+                else:
+                    aqi_val = get_aqi_sub_index(float(avg_val), "pm2_5")
+                    import math
+                    safe = round(aqi_val) if (aqi_val and not math.isnan(float(aqi_val))) else None
+                    aqi_series.append({"date": entry["date"], "avg": safe})
+            except Exception as ex:
+                print(f"[monthly_average] AQI calc error: {ex}", flush=True)
+                aqi_series.append({"date": entry["date"], "avg": None})
+
+        return jsonify({
+            "city": city_name,
+            "start_date": str(start_date),
+            "end_date": str(end_date),
+            "aqi": aqi_series,
+            "pollutants": results
+        })
+
+    except Exception as e:
+        print(f"[monthly_average] Error: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
