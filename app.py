@@ -13,6 +13,66 @@ import time
 
 IST = ZoneInfo("Asia/Kolkata")
 
+# ── EnvAlert cache & helpers ──────────────────────────────────────────────────
+import time as _time
+_envalert_cache = {"data": None, "ts": 0}
+_CACHE_TTL = 300  # 5 minutes
+
+ENVALERT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://erc.mp.gov.in/EnvAlert/",
+    "Origin": "https://erc.mp.gov.in",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-IN,en;q=0.9,hi;q=0.8",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+def fetch_envalert_all_with_cache():
+    """Fetch ALL stations from EnvAlert with Indian headers, retry, and cache."""
+    now = _time.time()
+    if _envalert_cache["data"] and (now - _envalert_cache["ts"]) < _CACHE_TTL:
+        print("[EnvAlert] Serving from cache", flush=True)
+        return _envalert_cache["data"]
+    url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
+    last_err = None
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=ENVALERT_HEADERS, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                _envalert_cache["data"] = data
+                _envalert_cache["ts"] = now
+                print(f"[EnvAlert] Fetched {len(data)} stations (attempt {attempt+1})", flush=True)
+                return data
+        except Exception as e:
+            last_err = e
+            print(f"[EnvAlert] Attempt {attempt+1} failed: {e}", flush=True)
+            _time.sleep(2)
+    if _envalert_cache["data"]:
+        print("[EnvAlert] All retries failed, serving stale cache", flush=True)
+        return _envalert_cache["data"]
+    print(f"[EnvAlert] All retries failed, no cache: {last_err}", flush=True)
+    return None
+
+
+def fetch_envalert_station_with_retry(station_id):
+    """Fetch single station with Indian headers and retry."""
+    url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
+    for attempt in range(3):
+        try:
+            resp = requests.post(url, headers=ENVALERT_HEADERS, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    return data[0]
+                return data
+        except Exception as e:
+            print(f"[EnvAlert] Station {station_id} attempt {attempt+1} failed: {e}", flush=True)
+            _time.sleep(1)
+    return None
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Disable GPU for CPU inference
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
