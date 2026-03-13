@@ -13,10 +13,9 @@ import time
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# ── EnvAlert cache & helpers ──────────────────────────────────────────────────
-import time as _time
+# ── EnvAlert cache & helpers (permanent fix) ─────────────────────────────────
 _envalert_cache = {"data": None, "ts": 0}
-_CACHE_TTL = 300  # 5 minutes
+_CACHE_TTL = 300  # 5 minutes — serve cached data if EnvAlert blocks
 
 ENVALERT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -28,8 +27,8 @@ ENVALERT_HEADERS = {
 }
 
 def fetch_envalert_all_with_cache():
-    """Fetch ALL stations from EnvAlert with Indian headers, retry, and cache."""
-    now = _time.time()
+    """Fetch ALL stations with Indian headers, 3 retries, 5-min cache."""
+    now = time.time()
     if _envalert_cache["data"] and (now - _envalert_cache["ts"]) < _CACHE_TTL:
         print("[EnvAlert] Serving from cache", flush=True)
         return _envalert_cache["data"]
@@ -48,16 +47,23 @@ def fetch_envalert_all_with_cache():
         except Exception as e:
             last_err = e
             print(f"[EnvAlert] Attempt {attempt+1} failed: {e}", flush=True)
-            _time.sleep(2)
+            time.sleep(2)
     if _envalert_cache["data"]:
-        print("[EnvAlert] All retries failed, serving stale cache", flush=True)
+        print("[EnvAlert] All retries failed — serving stale cache", flush=True)
         return _envalert_cache["data"]
     print(f"[EnvAlert] All retries failed, no cache: {last_err}", flush=True)
     return None
 
 
 def fetch_envalert_station_with_retry(station_id):
-    """Fetch single station with Indian headers and retry."""
+    """Fetch single station — first from ALL cache, then individual with retry."""
+    # Try cache first — avoids individual station blocks entirely
+    cached = fetch_envalert_all_with_cache()
+    if cached:
+        for st in cached:
+            if str(st.get("station_id")) == str(station_id):
+                return st
+    # Fallback: individual fetch with Indian headers
     url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
     for attempt in range(3):
         try:
@@ -69,9 +75,39 @@ def fetch_envalert_station_with_retry(station_id):
                 return data
         except Exception as e:
             print(f"[EnvAlert] Station {station_id} attempt {attempt+1} failed: {e}", flush=True)
-            _time.sleep(1)
+            time.sleep(1)
     return None
+
+
+# Hardcoded MP city coordinates — instant, no API needed
+MP_CITY_COORDS = {
+    "Indore": (22.7196, 75.8577), "Bhopal": (23.2599, 77.4126),
+    "Jabalpur": (23.1815, 79.9864), "Gwalior": (26.2183, 78.1828),
+    "Ujjain": (23.1765, 75.7885), "Sagar": (23.8388, 78.7378),
+    "Dewas": (22.9623, 76.0552), "Satna": (24.5694, 80.8322),
+    "Ratlam": (23.3315, 75.0367), "Rewa": (24.5362, 81.2956),
+    "Katni": (23.8333, 80.4000), "Singrauli": (24.1997, 82.6739),
+    "Khandwa": (21.8245, 76.3490), "Khargone": (21.8234, 75.6127),
+    "Damoh": (23.8333, 79.4333), "Neemuch": (24.4760, 74.8693),
+    "Panna": (24.7167, 80.1833), "Pithampur": (22.6167, 75.6833),
+    "Narsinghpur": (22.9497, 79.1942), "Maihar": (24.2667, 80.7667),
+    "Mandideep": (23.1000, 77.5333), "Betul": (21.9000, 77.9000),
+    "Anuppur": (23.1028, 81.6850), "Chhindwara": (22.0574, 78.9382),
+    "Bhind": (26.5613, 78.7876), "Morena": (26.4944, 77.9983),
+    "Shivpuri": (25.4231, 77.6578), "Chhatarpur": (24.9167, 79.5833),
+    "Seoni": (22.0856, 79.5414), "Balaghat": (21.8133, 80.1860),
+    "Raisen": (23.3314, 77.7887), "Rajgarh": (24.0167, 76.7333),
+    "Shajapur": (23.4268, 76.2774), "Dhar": (22.5985, 75.2985),
+    "Barwani": (22.0333, 74.9000), "Sidhi": (24.4167, 81.8833),
+    "Umaria": (23.5245, 80.8380), "Dindori": (22.9437, 81.0790),
+    "Ashoknagar": (24.5750, 77.7283), "Guna": (24.6481, 77.3152),
+    "Nagda": (23.4500, 75.4167), "Itarsi": (22.6167, 77.7667),
+    "Shahdol": (23.2833, 81.3500), "Mandsaur": (24.0765, 75.0711),
+    "Narmadapuram": (22.7533, 77.7125), "Vidisha": (23.5251, 77.8082),
+    "Sehore": (23.2006, 77.0845), "CTSDF": (23.2599, 77.4126),
+}
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 # Disable GPU for CPU inference
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
@@ -296,21 +332,24 @@ def get_model(pollutant):
             models_loaded[pollutant] = False
     return models.get(pollutant)
 
-# Cache for geocoding results (city -> coordinates)
-@lru_cache(maxsize=100)
+@lru_cache(maxsize=200)
 def get_city_coordinates(city_name):
+    # Instant lookup from hardcoded MP coords — no API needed
+    for key, coords in MP_CITY_COORDS.items():
+        if key.lower() == city_name.lower():
+            return coords
+    # Fallback to OpenWeatherMap only for unknown cities
     try:
-        url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name}&limit=1&appid={api_key}"
-        res = requests.get(url, timeout=5)
+        url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name},Madhya Pradesh,IN&limit=1&appid={api_key}"
+        res = requests.get(url, timeout=8)
         data = res.json()
         if data and isinstance(data, list):
-            item = data[0]
-            lat = item.get('lat')
-            lon = item.get('lon')
+            lat = data[0].get("lat")
+            lon = data[0].get("lon")
             if lat is not None and lon is not None:
                 return lat, lon
     except Exception as e:
-        print("Error in get_city_coordinates:", e, flush=True)
+        print(f"[get_city_coordinates] fallback failed for {city_name}: {e}", flush=True)
     return None, None
 
 def fetch_envalert_current_aqi(station_id):
@@ -341,9 +380,16 @@ def get_today_data_from_envalert(city_name):
         all_pollutant_values = {p: [] for p in TARGET_POLLUTANTS}
         all_pollutant_aqis = {p: [] for p in TARGET_POLLUTANTS}
         
-        # Use ThreadPoolExecutor to fetch station data concurrently
-        with ThreadPoolExecutor(max_workers=min(len(station_ids), 5)) as executor:
-            station_data_list = list(executor.map(fetch_envalert_current_aqi, station_ids))
+        # Get station data from ALL-stations cache (avoids individual blocks)
+        all_cached = fetch_envalert_all_with_cache()
+        station_data_list = []
+        if all_cached:
+            cached_map = {str(st.get("station_id")): st for st in all_cached}
+            station_data_list = [cached_map.get(str(sid)) for sid in station_ids]
+        # Fallback: individual fetch if cache empty
+        if not any(station_data_list):
+            with ThreadPoolExecutor(max_workers=min(len(station_ids), 5)) as executor:
+                station_data_list = list(executor.map(fetch_envalert_current_aqi, station_ids))
         
         for station_data in station_data_list:
             if not station_data:
@@ -413,8 +459,17 @@ def fetch_pollutant_series(lat, lon, pollutant):
             f"&start_date={start_date}&end_date={end_date}"
             f"&hourly={api_field}&timezone=Asia%2FKolkata"
         )
-        response = requests.get(url, timeout=10)
-        data = response.json()
+        data = None
+        for _attempt in range(3):
+            try:
+                response = requests.get(url, timeout=20)
+                data = response.json()
+                break
+            except Exception as _e:
+                print(f"[{pollutant}] pollutant fetch attempt {_attempt+1} failed: {_e}", flush=True)
+                time.sleep(1)
+        if not data:
+            return [], []
         values = data["hourly"].get(api_field, [])
         timestamps = data["hourly"].get("time", [])
 
@@ -439,17 +494,22 @@ def fetch_pollutant_series(lat, lon, pollutant):
         return [], []
 
 def fetch_weather_series(lat, lon):
-    try:
-        end_date = datetime.utcnow().date() - timedelta(days=1)
-        start_date = end_date - timedelta(days=4)
-        weather_params = ",".join(WEATHER_COLS)
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly={weather_params}"
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        hourly = data["hourly"]
-        return [[hourly[col][i] for col in WEATHER_COLS] for i in range(len(hourly['time']))]
-    except:
-        return []
+    end_date = datetime.utcnow().date() - timedelta(days=1)
+    start_date = end_date - timedelta(days=4)
+    weather_params = ",".join(WEATHER_COLS)
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly={weather_params}"
+    for attempt in range(3):
+        try:
+            response = requests.get(url, timeout=20)
+            data = response.json()
+            hourly = data["hourly"]
+            result = [[hourly[col][i] for col in WEATHER_COLS] for i in range(len(hourly['time']))]
+            if result:
+                return result
+        except Exception as e:
+            print(f"[fetch_weather_series] Attempt {attempt+1} failed: {e}", flush=True)
+            import time as t; t.sleep(1)
+    return []
 
 def calculate_errors(envalert_today_data, model_predictions_for_error):
     """
@@ -653,7 +713,8 @@ def predict():
         # 🌦 Weather data
         weather_data = fetch_weather_series(lat, lon)
         if not weather_data:
-            return jsonify({"error": "Weather fetch failed"}), 400
+            print(f"[predict] Weather fetch failed for {city_name}, using empty fallback", flush=True)
+            weather_data = []  # Continue without weather — model will use defaults
 
         # ✅ EnvAlert (PRIMARY → city stations)
         envalert_today_data = get_today_data_from_envalert(city_name)
@@ -809,8 +870,17 @@ def weather_forecast():
             f"&timezone=auto&start_date={start_date}&end_date={end_date}"
         )
 
-        response = requests.get(url, timeout=10)
-        data = response.json()
+        data = None
+        for _attempt in range(3):
+            try:
+                response = requests.get(url, timeout=15)
+                data = response.json()
+                break
+            except Exception as _e:
+                print(f"[weather] attempt {_attempt+1} failed: {_e}", flush=True)
+                time.sleep(1)
+        if not data:
+            return jsonify({"error": "Weather service unavailable"}), 503
         daily = data.get("daily", {})
 
         forecast = []
@@ -839,13 +909,20 @@ def weather_forecast():
 @app.route('/api/station/<int:station_id>', methods=['GET'])
 def proxy_station_aqi(station_id):
     try:
+        # First try to get from ALL stations cache — faster and avoids individual blocks
+        all_stations = fetch_envalert_all_with_cache()
+        if all_stations:
+            for st in all_stations:
+                if str(st.get("station_id")) == str(station_id):
+                    return jsonify([st])
+        # Fallback to individual fetch
         data = fetch_envalert_station_with_retry(station_id)
         if data is None:
             return jsonify([]), 200
         return jsonify(data if isinstance(data, list) else [data])
     except Exception as e:
         print(f"Error proxying station {station_id}: {e}", flush=True)
-        return jsonify([]), 200  # Return empty array so frontend doesn't crash
+        return jsonify([]), 200
 
 @app.route('/api/get_average', methods=['GET'])
 def get_average():
@@ -1164,7 +1241,16 @@ def monthly_average():
                 f"&hourly={api_field}&timezone=Asia%2FKolkata"
             )
             try:
-                resp = requests.get(url, timeout=15)
+                resp = None
+                for _ma_attempt in range(3):
+                    try:
+                        resp = requests.get(url, timeout=20)
+                        break
+                    except Exception as _mae:
+                        print(f"[monthly_average] attempt {_ma_attempt+1} failed: {_mae}", flush=True)
+                        time.sleep(1)
+                if resp is None:
+                    continue
                 d = resp.json()
                 hourly_values = d["hourly"].get(api_field, [])
                 hourly_times  = d["hourly"].get("time", [])
