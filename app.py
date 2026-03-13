@@ -859,31 +859,45 @@ def weather_forecast():
         if lat is None or lon is None:
             return jsonify({"error": "City not found"}), 404
 
-        today = datetime.now(IST).date()  # IST date — fixes UTC/IST mismatch
+        today = datetime.now(IST).date()
         start_date = today.strftime("%Y-%m-%d")
         end_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
 
-        url = (
+        # Call 1: daily forecast (no current — avoids Open-Meteo conflict)
+        daily_url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
-            f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m,apparent_temperature,precipitation,weathercode"
             f"&timezone=Asia/Kolkata&start_date={start_date}&end_date={end_date}"
         )
+        # Call 2: current weather only (no date range)
+        current_url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={lat}&longitude={lon}"
+            f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m,apparent_temperature,precipitation,weathercode"
+            f"&timezone=Asia/Kolkata"
+        )
 
-        data = None
+        daily_data = None
+        current_data = None
         for _attempt in range(3):
             try:
-                response = requests.get(url, timeout=15)
-                data = response.json()
+                if daily_data is None:
+                    r1 = requests.get(daily_url, timeout=15)
+                    daily_data = r1.json()
+                if current_data is None:
+                    r2 = requests.get(current_url, timeout=15)
+                    current_data = r2.json()
                 break
             except Exception as _e:
                 print(f"[weather] attempt {_attempt+1} failed: {_e}", flush=True)
                 time.sleep(1)
-        if not data:
+
+        if not daily_data:
             return jsonify({"error": "Weather service unavailable"}), 503
-        daily = data.get("daily", {})
-        current = data.get("current", {})
+
+        daily = daily_data.get("daily", {})
+        current = current_data.get("current", {}) if current_data else {}
 
         forecast = []
         for i in range(len(daily.get("time", []))):
