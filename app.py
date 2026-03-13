@@ -494,34 +494,21 @@ def fetch_pollutant_series(lat, lon, pollutant):
         return [], []
 
 def fetch_weather_series(lat, lon):
-    # Use historical archive API for past data — forecast API doesn't serve past dates well
-    end_date = datetime.now(IST).date() - timedelta(days=1)
+    end_date = datetime.utcnow().date() - timedelta(days=1)
     start_date = end_date - timedelta(days=4)
     weather_params = ",".join(WEATHER_COLS)
-    # Try archive API first, fallback to forecast API
-    urls = [
-        f"https://archive-api.open-meteo.com/v1/archive?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly={weather_params}&timezone=Asia/Kolkata",
-        f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly={weather_params}&timezone=Asia/Kolkata&past_days=5",
-    ]
-    for url in urls:
-        for attempt in range(2):
-            try:
-                response = requests.get(url, timeout=20)
-                data = response.json()
-                if "error" in data or "reason" in data:
-                    print(f"[fetch_weather_series] API error: {data.get('reason', data)}", flush=True)
-                    break
-                hourly = data.get("hourly", {})
-                if not hourly or "time" not in hourly:
-                    print(f"[fetch_weather_series] No hourly data in response: {list(data.keys())}", flush=True)
-                    break
-                result = [[hourly[col][i] if col in hourly else 0 for col in WEATHER_COLS] for i in range(len(hourly['time']))]
-                if result:
-                    print(f"[fetch_weather_series] Got {len(result)} rows", flush=True)
-                    return result
-            except Exception as e:
-                print(f"[fetch_weather_series] Attempt {attempt+1} failed: {e}", flush=True)
-                time.sleep(1)
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly={weather_params}"
+    for attempt in range(3):
+        try:
+            response = requests.get(url, timeout=20)
+            data = response.json()
+            hourly = data["hourly"]
+            result = [[hourly[col][i] for col in WEATHER_COLS] for i in range(len(hourly['time']))]
+            if result:
+                return result
+        except Exception as e:
+            print(f"[fetch_weather_series] Attempt {attempt+1} failed: {e}", flush=True)
+            import time as t; t.sleep(1)
     return []
 
 def calculate_errors(envalert_today_data, model_predictions_for_error):
@@ -876,12 +863,12 @@ def weather_forecast():
         start_date = today.strftime("%Y-%m-%d")
         end_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
 
-        # Call 1: daily forecast
+        # Call 1: daily forecast (no current — avoids Open-Meteo conflict)
         daily_url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
-            f"&forecast_days=4&timezone=Asia/Kolkata"
+            f"&timezone=Asia/Kolkata&start_date={start_date}&end_date={end_date}"
         )
         # Call 2: current weather only (no date range)
         current_url = (
@@ -909,8 +896,6 @@ def weather_forecast():
         if not daily_data:
             return jsonify({"error": "Weather service unavailable"}), 503
 
-        if not daily_data or "error" in daily_data:
-            return jsonify({"error": "Weather service unavailable"}), 503
         daily = daily_data.get("daily", {})
         current = current_data.get("current", {}) if current_data else {}
 
