@@ -254,22 +254,8 @@ def get_city_coordinates(city_name):
     return None, None
 
 def fetch_envalert_current_aqi(station_id):
-    """Fetch current AQI data for a specific station"""
-    try:
-        url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
-        response = requests.post(url, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            # API returns a list with one station object
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]
-            return data
-        else:
-            print(f"EnvAlert AQI API failed for station {station_id} with status {response.status_code}", flush=True)
-            return None
-    except Exception as e:
-        print(f"Error fetching EnvAlert AQI for station {station_id}: {e}", flush=True)
-        return None
+    """Fetch current AQI data for a specific station — with retry and Indian headers"""
+    return fetch_envalert_station_with_retry(station_id)
 
 def get_today_data_from_envalert(city_name):
     """
@@ -545,11 +531,10 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1):
 
 
 def getAvgOfAllStationsValues():
-    url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
     try:
-        resp = requests.post(url, timeout=10)
-        resp.raise_for_status()
-        stations = resp.json()
+        stations = fetch_envalert_all_with_cache()
+        if not stations:
+            return None
 
         if not isinstance(stations, list):
             raise ValueError("Unexpected API response format")
@@ -794,15 +779,10 @@ def weather_forecast():
 @app.route('/api/station/<int:station_id>', methods=['GET'])
 def proxy_station_aqi(station_id):
     try:
-        url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://erc.mp.gov.in/",
-            "Accept": "application/json"
-        }
-        resp = requests.post(url, headers=headers, timeout=15)
-        data = resp.json()
-        return jsonify(data)
+        data = fetch_envalert_station_with_retry(station_id)
+        if data is None:
+            return jsonify([]), 200
+        return jsonify(data if isinstance(data, list) else [data])
     except Exception as e:
         print(f"Error proxying station {station_id}: {e}", flush=True)
         return jsonify([]), 200  # Return empty array so frontend doesn't crash
@@ -941,9 +921,7 @@ def predict_grid():
 def debug_stations():
     """Debug endpoint — shows raw EnvAlert API response for first 3 stations"""
     try:
-        url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
-        resp = requests.post(url, timeout=30)
-        data = resp.json()
+        data = fetch_envalert_all_with_cache()
         if isinstance(data, list) and len(data) > 0:
             return jsonify({
                 "total": len(data),
@@ -961,12 +939,9 @@ def all_stations_aqi():
     if request.method == "OPTIONS":
         return jsonify({"status": "OK"}), 200
     try:
-        url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
-        resp = requests.post(url, timeout=30)
-        resp.raise_for_status()
-        stations = resp.json()
-        if not isinstance(stations, list):
-            return jsonify({"error": "Unexpected response"}), 500
+        stations = fetch_envalert_all_with_cache()
+        if not stations or not isinstance(stations, list):
+            return jsonify({"error": "EnvAlert unavailable"}), 503
         result = {}
         for station in stations:
             sid = station.get("station_id")
@@ -994,13 +969,9 @@ def mp_ranking():
         city_name = (request.json or {}).get("city", "").strip()
 
         # ── 1. Fetch ALL station data ──────────────────────────────
-        url = "https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id=ALL"
-        resp = requests.post(url, timeout=30)
-        resp.raise_for_status()
-        stations = resp.json()
-
-        if not isinstance(stations, list) or len(stations) == 0:
-            return jsonify({"error": "No station data available"}), 500
+        stations = fetch_envalert_all_with_cache()
+        if not stations or not isinstance(stations, list) or len(stations) == 0:
+            return jsonify({"error": "No station data available"}), 503
 
         print(f"[mp_ranking] Got {len(stations)} stations. Sample keys: {list(stations[0].keys())}", flush=True)
 
