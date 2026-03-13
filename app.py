@@ -859,7 +859,7 @@ def weather_forecast():
         if lat is None or lon is None:
             return jsonify({"error": "City not found"}), 404
 
-        today = datetime.utcnow().date()
+        today = datetime.now(IST).date()  # IST date — fixes UTC/IST mismatch
         start_date = today.strftime("%Y-%m-%d")
         end_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
 
@@ -867,7 +867,8 @@ def weather_forecast():
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
-            f"&timezone=auto&start_date={start_date}&end_date={end_date}"
+            f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m,apparent_temperature,precipitation,weathercode"
+            f"&timezone=Asia/Kolkata&start_date={start_date}&end_date={end_date}"
         )
 
         data = None
@@ -882,6 +883,7 @@ def weather_forecast():
         if not data:
             return jsonify({"error": "Weather service unavailable"}), 503
         daily = data.get("daily", {})
+        current = data.get("current", {})
 
         forecast = []
         for i in range(len(daily.get("time", []))):
@@ -899,7 +901,15 @@ def weather_forecast():
 
         return jsonify({
             "city": city_name,
-            "forecast": forecast
+            "forecast": forecast,
+            "current": {
+                "temperature": current.get("temperature_2m"),
+                "feels_like": current.get("apparent_temperature"),
+                "humidity": current.get("relative_humidity_2m"),
+                "wind_speed": current.get("wind_speed_10m"),
+                "precipitation": current.get("precipitation"),
+                "weathercode": current.get("weathercode"),
+            }
         })
 
     except Exception as e:
@@ -1272,20 +1282,45 @@ def monthly_average():
                 results[pollutant] = []
 
         # Compute daily overall AQI from pm2_5 daily averages
-        aqi_series = []
+        import math
+        aqi_series_raw = []
         for entry in results.get("pm2_5", []):
             try:
                 avg_val = entry.get("avg")
                 if avg_val is None:
-                    aqi_series.append({"date": entry["date"], "avg": None})
+                    aqi_series_raw.append({"date": entry["date"], "avg": None})
                 else:
                     aqi_val = get_aqi_sub_index(float(avg_val), "pm2_5")
-                    import math
                     safe = round(aqi_val) if (aqi_val and not math.isnan(float(aqi_val))) else None
-                    aqi_series.append({"date": entry["date"], "avg": safe})
+                    aqi_series_raw.append({"date": entry["date"], "avg": safe})
             except Exception as ex:
                 print(f"[monthly_average] AQI calc error: {ex}", flush=True)
-                aqi_series.append({"date": entry["date"], "avg": None})
+                aqi_series_raw.append({"date": entry["date"], "avg": None})
+
+        # Apply correction factor: align Open-Meteo AQI to EnvAlert real sensor AQI
+        correction = 0
+        try:
+            envalert_today = get_today_data_from_envalert(city_name)
+            if envalert_today and "pm2_5" in envalert_today:
+                envalert_aqi_today = envalert_today["pm2_5"]["aqi"]
+                # Find today's Open-Meteo AQI
+                today_str = datetime.now(IST).date().strftime("%Y-%m-%d")
+                openmeteo_today = next((e["avg"] for e in aqi_series_raw if e["date"] == today_str and e["avg"] is not None), None)
+                if openmeteo_today:
+                    correction = round(envalert_aqi_today - openmeteo_today)
+                    print(f"[monthly_average] AQI correction for {city_name}: EnvAlert={envalert_aqi_today}, OpenMeteo={openmeteo_today}, offset={correction}", flush=True)
+        except Exception as ce:
+            print(f"[monthly_average] correction calc error: {ce}", flush=True)
+
+        # Apply correction clamped to ±80 to avoid wild shifts
+        correction = max(-80, min(80, correction))
+        aqi_series = []
+        for entry in aqi_series_raw:
+            if entry["avg"] is not None:
+                corrected = max(0, min(500, entry["avg"] + correction))
+                aqi_series.append({"date": entry["date"], "avg": corrected})
+            else:
+                aqi_series.append(entry)
 
         return jsonify({
             "city": city_name,
