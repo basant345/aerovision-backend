@@ -1336,6 +1336,31 @@ def monthly_average():
             else:
                 aqi_series.append(entry)
 
+        # Apply per-pollutant correction to align Open-Meteo values with EnvAlert sensors
+        try:
+            if envalert_today:
+                today_str = datetime.now(IST).date().strftime("%Y-%m-%d")
+                for pollutant in TARGET_POLLUTANTS:
+                    if pollutant not in envalert_today or pollutant not in results:
+                        continue
+                    live_val = envalert_today[pollutant]["value"]
+                    # Find today's Open-Meteo value for this pollutant
+                    today_entry = next((e for e in results[pollutant] if e["date"] == today_str), None)
+                    if not today_entry or today_entry["avg"] is None:
+                        continue
+                    pol_correction = round(live_val - today_entry["avg"], 2)
+                    # Clamp correction to ±100
+                    pol_correction = max(-100, min(100, pol_correction))
+                    print(f"[monthly_average] {pollutant} correction: live={live_val}, openmeteo={today_entry['avg']}, offset={pol_correction}", flush=True)
+                    # Apply to all days
+                    results[pollutant] = [
+                        {"date": e["date"], "avg": round(max(0, e["avg"] + pol_correction), 2)}
+                        if e["avg"] is not None else e
+                        for e in results[pollutant]
+                    ]
+        except Exception as pe:
+            print(f"[monthly_average] pollutant correction error: {pe}", flush=True)
+
         return jsonify({
             "city": city_name,
             "start_date": str(start_date),
