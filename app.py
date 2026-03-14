@@ -1214,7 +1214,7 @@ def mp_ranking():
                 "station_count": len(aqis),
             })
 
-        city_rankings.sort(key=lambda x: x["aqi"], reverse=True)
+        city_rankings.sort(key=lambda x: x["aqi"], reverse=False)
         for i, entry in enumerate(city_rankings):
             entry["rank"] = i + 1
 
@@ -1316,7 +1316,7 @@ def monthly_average():
         try:
             envalert_today = get_today_data_from_envalert(city_name)
             if envalert_today and "pm2_5" in envalert_today:
-                envalert_aqi_today = envalert_today["pm2_5"]["aqi"]
+                envalert_aqi_today = max([envalert_today[p]["aqi"] for p in TARGET_POLLUTANTS if p != "o3" and p in envalert_today])
                 # Find today's Open-Meteo AQI
                 today_str = datetime.now(IST).date().strftime("%Y-%m-%d")
                 openmeteo_today = next((e["avg"] for e in aqi_series_raw if e["date"] == today_str and e["avg"] is not None), None)
