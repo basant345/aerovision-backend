@@ -758,21 +758,25 @@ def predict():
         errors = calculate_errors(envalert_today_data, model_predictions_for_error)
 
         # ➕ Apply error correction (PM2.5 & PM10) → TODAY + FUTURE
-        # BIAS factor 0.85 → corrected value stays slightly below station reading (MPPCB requirement)
-        BIAS_FACTOR = 0.85
+        # Today (i=0): capped at 90% of station value so prediction stays below station
+        # Future days (i>0): only apply reduced bias (30%) to avoid flat same-value forecast
+        BIAS_FACTOR_TODAY  = 0.85
+        BIAS_FACTOR_FUTURE = 0.30
         station_pm25 = envalert_today_data.get("pm2_5", {}).get("value") if envalert_today_data else None
-        station_pm10_raw = envalert_today_data.get("pm10", {}).get("value") if envalert_today_data else None
-        station_caps = {"pm2_5": station_pm25, "pm10": station_pm10_raw}
+        station_pm10_val = envalert_today_data.get("pm10", {}).get("value") if envalert_today_data else None
+        station_caps = {"pm2_5": station_pm25, "pm10": station_pm10_val}
 
         for pollutant in ["pm2_5", "pm10"]:
             error_key = f"{pollutant}_concentration"
             if error_key in errors and pollutant in result:
                 for i in range(len(result[pollutant])):
-                    corrected = result[pollutant][i]["value"] + (errors[error_key] * BIAS_FACTOR)
-                    # Cap at 90% of station value — prediction must stay below station
-                    cap = station_caps.get(pollutant)
-                    if cap and corrected > cap * 0.90:
-                        corrected = cap * 0.90
+                    bias = BIAS_FACTOR_TODAY if i == 0 else BIAS_FACTOR_FUTURE
+                    corrected = result[pollutant][i]["value"] + (errors[error_key] * bias)
+                    # Cap only today at 90% of station value
+                    if i == 0:
+                        cap = station_caps.get(pollutant)
+                        if cap and corrected > cap * 0.90:
+                            corrected = cap * 0.90
                     result[pollutant][i]["value"] = round(corrected, 2)
 
                     new_aqi = get_aqi_sub_index(result[pollutant][i]["value"], pollutant)
@@ -783,19 +787,16 @@ def predict():
                     result[pollutant][i]["warning"] = warning
                     result[pollutant][i]["color"] = color
 
-        # ➕ PM10 = PM10 + PM2.5 (MODEL BASED) — capped at station value to avoid overprediction
+        # ➕ PM10 = PM10 + PM2.5 (MODEL BASED)
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
-
-        # Get station PM10 as upper cap
-        station_pm10 = envalert_today_data.get("pm10", {}).get("value") if envalert_today_data else None
 
         if pm10_preds and pm25_preds:
             for i in range(min(len(pm10_preds), len(pm25_preds))):
                 combined_value = pm10_preds[i]["value"] + pm25_preds[i]["value"]
-                # Cap at 90% of station value so prediction stays below station
-                if station_pm10 and combined_value > station_pm10 * 0.90:
-                    combined_value = round(station_pm10 * 0.90, 2)
+                # Cap only today's PM10 at 90% of station value
+                if i == 0 and station_pm10_val and combined_value > station_pm10_val * 0.90:
+                    combined_value = station_pm10_val * 0.90
                 pm10_preds[i]["value"] = round(combined_value, 2)
 
                 new_aqi = get_aqi_sub_index(combined_value, "pm10")
