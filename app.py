@@ -760,13 +760,20 @@ def predict():
         # ➕ Apply error correction (PM2.5 & PM10) → TODAY + FUTURE
         # BIAS factor 0.85 → corrected value stays slightly below station reading (MPPCB requirement)
         BIAS_FACTOR = 0.85
+        station_pm25 = envalert_today_data.get("pm2_5", {}).get("value") if envalert_today_data else None
+        station_pm10_raw = envalert_today_data.get("pm10", {}).get("value") if envalert_today_data else None
+        station_caps = {"pm2_5": station_pm25, "pm10": station_pm10_raw}
+
         for pollutant in ["pm2_5", "pm10"]:
             error_key = f"{pollutant}_concentration"
             if error_key in errors and pollutant in result:
                 for i in range(len(result[pollutant])):
-                    result[pollutant][i]["value"] = round(
-                        result[pollutant][i]["value"] + (errors[error_key] * BIAS_FACTOR), 2
-                    )
+                    corrected = result[pollutant][i]["value"] + (errors[error_key] * BIAS_FACTOR)
+                    # Cap at 90% of station value — prediction must stay below station
+                    cap = station_caps.get(pollutant)
+                    if cap and corrected > cap * 0.90:
+                        corrected = cap * 0.90
+                    result[pollutant][i]["value"] = round(corrected, 2)
 
                     new_aqi = get_aqi_sub_index(result[pollutant][i]["value"], pollutant)
                     result[pollutant][i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
@@ -776,13 +783,19 @@ def predict():
                     result[pollutant][i]["warning"] = warning
                     result[pollutant][i]["color"] = color
 
-        # ➕ PM10 = PM10 + PM2.5 (MODEL BASED)
+        # ➕ PM10 = PM10 + PM2.5 (MODEL BASED) — capped at station value to avoid overprediction
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
+
+        # Get station PM10 as upper cap
+        station_pm10 = envalert_today_data.get("pm10", {}).get("value") if envalert_today_data else None
 
         if pm10_preds and pm25_preds:
             for i in range(min(len(pm10_preds), len(pm25_preds))):
                 combined_value = pm10_preds[i]["value"] + pm25_preds[i]["value"]
+                # Cap at 90% of station value so prediction stays below station
+                if station_pm10 and combined_value > station_pm10 * 0.90:
+                    combined_value = round(station_pm10 * 0.90, 2)
                 pm10_preds[i]["value"] = round(combined_value, 2)
 
                 new_aqi = get_aqi_sub_index(combined_value, "pm10")
