@@ -758,12 +758,14 @@ def predict():
         errors = calculate_errors(envalert_today_data, model_predictions_for_error)
 
         # ➕ Apply error correction (PM2.5 & PM10) → TODAY + FUTURE
+        # BIAS factor 0.85 → corrected value stays slightly below station reading (MPPCB requirement)
+        BIAS_FACTOR = 0.85
         for pollutant in ["pm2_5", "pm10"]:
             error_key = f"{pollutant}_concentration"
             if error_key in errors and pollutant in result:
                 for i in range(len(result[pollutant])):
                     result[pollutant][i]["value"] = round(
-                        result[pollutant][i]["value"] + errors[error_key], 2
+                        result[pollutant][i]["value"] + (errors[error_key] * BIAS_FACTOR), 2
                     )
 
                     new_aqi = get_aqi_sub_index(result[pollutant][i]["value"], pollutant)
