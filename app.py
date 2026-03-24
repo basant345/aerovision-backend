@@ -761,7 +761,7 @@ def predict():
         # Today (i=0): capped at 90% of station value so prediction stays below station
         # Future days (i>0): only apply reduced bias (30%) to avoid flat same-value forecast
         BIAS_FACTOR_TODAY  = 0.85
-        BIAS_FACTOR_FUTURE = 0.30
+        BIAS_FACTOR_FUTURE = 0.70
         station_pm25 = envalert_today_data.get("pm2_5", {}).get("value") if envalert_today_data else None
         station_pm10_val = envalert_today_data.get("pm10", {}).get("value") if envalert_today_data else None
         station_caps = {"pm2_5": station_pm25, "pm10": station_pm10_val}
