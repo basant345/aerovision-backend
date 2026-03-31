@@ -1390,6 +1390,130 @@ def monthly_average():
         return jsonify({"error": str(e)}), 500
 
 
+# ── LLM Chat Route (Gemini) ───────────────────────────────────────────────
+# Requires: pip install google-generativeai python-dotenv
+
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configure Gemini API Key
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+@app.route('/api/chat', methods=['POST', 'OPTIONS'])
+def chat():
+    if request.method == 'OPTIONS':
+        return jsonify({"status": "OK"}), 200
+
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+
+        user_message = data.get("message", "").strip()
+        current_city = data.get("city", "")
+
+        if not user_message:
+            return jsonify({"error": "message is required"}), 400
+
+        # ── Detect if user is asking about a specific MP city ──
+        asked_city = None
+        for city_key in CITY_STATIONS.keys():
+            if city_key.lower() in user_message.lower():
+                asked_city = city_key
+                break
+
+        # Use asked city if found, otherwise fall back to selected city
+        target_city = asked_city or current_city
+
+        # Fetch live EnvAlert data for that city
+        live_aqi = None
+        if target_city:
+            live_aqi = get_today_data_from_envalert(target_city)
+
+        # Build context string
+        context = ""
+        if target_city and live_aqi:
+            context = f"City: {target_city}\nLive AQI data: {live_aqi}\n\n"
+        elif target_city:
+            context = f"City: {target_city}\n(No live data available, use general knowledge)\n\n"
+
+        # 🔥 System Prompt
+        system_prompt = (
+            "You are AeroBot, an air quality assistant for Madhya Pradesh, India. "
+            "You have knowledge about air quality, AQI levels, pollutants, and health impacts "
+            "for all major cities in Madhya Pradesh including Indore, Bhopal, Jabalpur, Gwalior, "
+            "Ujjain, Sagar, Dewas, Satna, Ratlam, Rewa, Katni, Singrauli, Khandwa, Khargone, "
+            "Pithampur, Mandideep, Narsinghpur, Neemuch, Maihar, Betul, Anuppur, and others. "
+            "When a user asks about any MP city, answer based on the live data provided or general knowledge. "
+            "If the user asks about a city not in Madhya Pradesh, politely tell them this assistant "
+            "only covers Madhya Pradesh cities. "
+            "IMPORTANT: Always respond in plain simple paragraphs only. "
+            "Do NOT use bullet points, asterisks (*), bold (**), headers (#), "
+            "or any markdown formatting whatsoever. "
+            "Write everything as natural flowing sentences in 2-3 short paragraphs. "
+            "Be concise, friendly, and use simple language. "
+            "Respond in the same language the user writes in (Hindi or English)."
+        )
+
+        # 🔥 Combine system + context + user prompt
+        full_prompt = (
+            f"{system_prompt}\n\n"
+            f"{context}"
+            f"User question: {user_message}"
+        )
+
+        # Call Gemini
+        # Call Gemini — try multiple models if quota exceeded
+        GEMINI_MODELS = [
+             "gemini-2.5-flash",
+             "gemini-2.5-flash-lite",
+             "gemini-2.0-flash-001",
+             "gemini-2.0-flash-lite",
+        ]
+
+        reply = None
+        for model_name in GEMINI_MODELS:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(full_prompt)
+                reply = response.text
+                print(f"[/api/chat] Used model: {model_name}", flush=True)
+                break
+            except Exception as model_err:
+                print(f"[/api/chat] Model {model_name} failed: {model_err}", flush=True)
+                continue
+
+        if not reply:
+                return jsonify({"error": "All Gemini models quota exceeded. Try again tomorrow."}), 429
+
+        # Clean any remaining markdown just in case
+        import re
+        reply = re.sub(r'\*\*(.*?)\*\*', r'\1', reply)
+        reply = re.sub(r'\*(.*?)\*', r'\1', reply)
+        reply = re.sub(r'^\*\s+', '', reply, flags=re.MULTILINE)
+        reply = re.sub(r'^\-\s+', '', reply, flags=re.MULTILINE)
+        reply = re.sub(r'#{1,6}\s', '', reply)
+
+        print(f"[/api/chat] asked_city={asked_city}, target={target_city} → reply length={len(reply)}", flush=True)
+        return jsonify({"reply": reply})
+
+    except Exception as e:
+        print(f"[/api/chat] Error: {e}", flush=True)
+        return jsonify({"error": "LLM service unavailable"}), 500
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route('/debug_models', methods=['GET'])
+def debug_models():
+    try:
+        available = [m.name for m in genai.list_models() 
+                     if 'generateContent' in m.supported_generation_methods]
+        return jsonify({"models": available})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 if __name__ == "__main__":
     print("🚀 Flask server is starting...", flush=True)
     port = int(os.environ.get("PORT", 5000))
