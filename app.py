@@ -1436,7 +1436,32 @@ def chat():
         # Build context string
         context = ""
         if target_city and live_aqi:
-            context = f"City: {target_city}\nLive AQI data: {live_aqi}\n\n"
+            # Overall AQI = max of all pollutant AQIs excluding o3
+            # (same logic as your dashboard)
+            overall_aqi = max(
+                [live_aqi[p]["aqi"] for p in live_aqi if p != "o3"],
+                default=0
+            )
+            category, _, _ = get_category_info(overall_aqi)
+
+            pollutant_names = {
+                "pm2_5": "PM2.5", "pm10": "PM10",
+                "no2": "NO2", "so2": "SO2",
+                "o3": "O3", "co": "CO"
+            }
+            pollutant_lines = ""
+            for p, vals in live_aqi.items():
+                name = pollutant_names.get(p, p)
+                pollutant_lines += f"  {name}: value={round(vals['value'], 2)}, AQI={vals['aqi']}\n"
+
+            context = (
+                f"City: {target_city}\n"
+                f"Overall AQI right now: {overall_aqi} ({category})\n"
+                f"Individual pollutants:\n{pollutant_lines}\n"
+                f"IMPORTANT: When user asks about AQI of {target_city}, "
+                f"always report the Overall AQI as {overall_aqi}. "
+                f"Do not report individual pollutant AQIs as the overall AQI.\n\n"
+            )
         elif target_city:
             context = f"City: {target_city}\n(No live data available, use general knowledge)\n\n"
 
