@@ -118,7 +118,7 @@ app = Flask(__name__)
 # React Native doesn't send traditional browser origins
 CORS(app, 
      resources={r"/*": {
-         "origins": ["https://airqualitycities.iiti.ac.in", "http://localhost:8080"],
+         "origins": ["https://airqualitycities.iiti.ac.in", "http://localhost:8080", "https://erc.mp.gov.in"],
          "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
          "allow_headers": ["Content-Type", "Authorization", "Accept"],
          "expose_headers": ["Content-Type"],
@@ -445,18 +445,12 @@ def get_today_data_from_envalert(city_name):
 
 def fetch_pollutant_series(lat, lon, pollutant):
     try:
-        end_datetime_ist = datetime.now(IST).replace(minute=0, second=0, microsecond=0)
-        start_datetime = end_datetime_ist - timedelta(hours=71)
-
-        start_date = start_datetime.date().strftime("%Y-%m-%d")
-        end_date = end_datetime_ist.date().strftime("%Y-%m-%d")
-
         api_field = POLLUTANT_API_MAP[pollutant]
 
         url = (
             f"https://air-quality-api.open-meteo.com/v1/air-quality"
             f"?latitude={lat}&longitude={lon}"
-            f"&start_date={start_date}&end_date={end_date}"
+            f"&past_days=3&forecast_days=1"
             f"&hourly={api_field}&timezone=Asia%2FKolkata"
         )
         data = None
@@ -469,6 +463,12 @@ def fetch_pollutant_series(lat, lon, pollutant):
                 print(f"[{pollutant}] pollutant fetch attempt {_attempt+1} failed: {_e}", flush=True)
                 time.sleep(1)
         if not data:
+            return [], []
+        if data.get("error"):
+            print(f"[{pollutant.upper()}] API error: {data.get('reason', 'unknown')}", flush=True)
+            return [], []
+        if "hourly" not in data:
+            print(f"[{pollutant.upper()}] No 'hourly' in response. Keys: {list(data.keys())}", flush=True)
             return [], []
         values = data["hourly"].get(api_field, [])
         timestamps = data["hourly"].get("time", [])
@@ -494,14 +494,18 @@ def fetch_pollutant_series(lat, lon, pollutant):
         return [], []
 
 def fetch_weather_series(lat, lon):
-    end_date = datetime.utcnow().date() - timedelta(days=1)
-    start_date = end_date - timedelta(days=4)
     weather_params = ",".join(WEATHER_COLS)
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&start_date={start_date}&end_date={end_date}&hourly={weather_params}"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&past_days=5&forecast_days=1&hourly={weather_params}&timezone=Asia%2FKolkata"
     for attempt in range(3):
         try:
             response = requests.get(url, timeout=20)
             data = response.json()
+            if data.get("error"):
+                print(f"[fetch_weather_series] API error: {data.get('reason', 'unknown')}", flush=True)
+                return []
+            if "hourly" not in data:
+                print(f"[fetch_weather_series] No 'hourly' in response. Keys: {list(data.keys())}", flush=True)
+                return []
             hourly = data["hourly"]
             result = [[hourly[col][i] for col in WEATHER_COLS] for i in range(len(hourly['time']))]
             if result:
@@ -1292,6 +1296,14 @@ def monthly_average():
                 if resp is None:
                     continue
                 d = resp.json()
+                if d.get("error"):
+                    print(f"[monthly_average] {pollutant} API error: {d.get('reason', 'unknown')}", flush=True)
+                    results[pollutant] = []
+                    continue
+                if "hourly" not in d:
+                    print(f"[monthly_average] {pollutant} no 'hourly' key. Keys: {list(d.keys())}", flush=True)
+                    results[pollutant] = []
+                    continue
                 hourly_values = d["hourly"].get(api_field, [])
                 hourly_times  = d["hourly"].get("time", [])
 
