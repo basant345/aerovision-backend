@@ -443,35 +443,50 @@ def get_today_data_from_envalert(city_name):
         print(f"Error in get_today_data_from_envalert: {e}", flush=True)
         return None
 
+_openmeteo_cache = {}
+_OPENMETEO_TTL = 3600  # 1 hour
+
+def fetch_all_pollutant_series(lat, lon):
+    """Fetch ALL 6 pollutants in ONE API call and cache for 1 hour."""
+    cache_key = f"{round(lat,3)}_{round(lon,3)}"
+    now = time.time()
+    if cache_key in _openmeteo_cache and (now - _openmeteo_cache[cache_key]["ts"]) < _OPENMETEO_TTL:
+        print(f"[OpenMeteo] Serving from cache for {cache_key}", flush=True)
+        return _openmeteo_cache[cache_key]["data"]
+    all_fields = ",".join(POLLUTANT_API_MAP.values())
+    url = (
+        f"https://air-quality-api.open-meteo.com/v1/air-quality"
+        f"?latitude={lat}&longitude={lon}"
+        f"&past_days=3&forecast_days=1"
+        f"&hourly={all_fields}&timezone=Asia%2FKolkata"
+    )
+    for _attempt in range(3):
+        try:
+            response = requests.get(url, timeout=20)
+            data = response.json()
+            if data.get("error"):
+                print(f"[OpenMeteo] API error: {data.get('reason', 'unknown')}", flush=True)
+                return None
+            if "hourly" not in data:
+                print(f"[OpenMeteo] No 'hourly' key. Keys: {list(data.keys())}", flush=True)
+                return None
+            _openmeteo_cache[cache_key] = {"data": data["hourly"], "ts": now}
+            print(f"[OpenMeteo] Fetched all pollutants for {cache_key} (attempt {_attempt+1})", flush=True)
+            return data["hourly"]
+        except Exception as _e:
+            print(f"[OpenMeteo] Attempt {_attempt+1} failed: {_e}", flush=True)
+            time.sleep(1)
+    return None
+
 def fetch_pollutant_series(lat, lon, pollutant):
     try:
         api_field = POLLUTANT_API_MAP[pollutant]
 
-        url = (
-            f"https://air-quality-api.open-meteo.com/v1/air-quality"
-            f"?latitude={lat}&longitude={lon}"
-            f"&past_days=3&forecast_days=1"
-            f"&hourly={api_field}&timezone=Asia%2FKolkata"
-        )
-        data = None
-        for _attempt in range(3):
-            try:
-                response = requests.get(url, timeout=20)
-                data = response.json()
-                break
-            except Exception as _e:
-                print(f"[{pollutant}] pollutant fetch attempt {_attempt+1} failed: {_e}", flush=True)
-                time.sleep(1)
-        if not data:
+        hourly = fetch_all_pollutant_series(lat, lon)
+        if not hourly:
             return [], []
-        if data.get("error"):
-            print(f"[{pollutant.upper()}] API error: {data.get('reason', 'unknown')}", flush=True)
-            return [], []
-        if "hourly" not in data:
-            print(f"[{pollutant.upper()}] No 'hourly' in response. Keys: {list(data.keys())}", flush=True)
-            return [], []
-        values = data["hourly"].get(api_field, [])
-        timestamps = data["hourly"].get("time", [])
+        values = hourly.get(api_field, [])
+        timestamps = hourly.get("time", [])
 
         # Align last 72 hours ending at current hour
         current_hour = datetime.now(IST).replace(minute=0, second=0, microsecond=0)
