@@ -492,7 +492,11 @@ def fetch_all_pollutant_series(lat, lon):
             response = requests.get(url, timeout=20)
             data = response.json()
             if data.get("error"):
-                print(f"[OpenMeteo] API error: {data.get('reason', 'unknown')}", flush=True)
+                reason = data.get('reason', 'unknown')
+                print(f"[OpenMeteo] API error: {reason}", flush=True)
+                # Daily limit hit — no point retrying, break immediately
+                if "limit" in reason.lower():
+                    break
                 return None
             if "hourly" not in data:
                 print(f"[OpenMeteo] No 'hourly' key. Keys: {list(data.keys())}", flush=True)
@@ -621,14 +625,37 @@ def calculate_errors(envalert_today_data, model_predictions_for_error):
     
     return errors
 
-def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1):
+def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1, envalert_fallback=None):
     """
     Predict pollutant values starting from a given day.
-    start_day=0 for today, start_day=1 for tomorrow onwards
+    start_day=0 for today, start_day=1 for tomorrow onwards.
+    envalert_fallback: dict {pollutant: {value, aqi}} — used when OpenMeteo data is unavailable.
     """
     try:
         model = get_model(pollutant)  # Use lazy loading
         if not model or len(data) < 72:
+            # ── EnvAlert persistence fallback ─────────────────────────────────
+            if envalert_fallback and pollutant in envalert_fallback:
+                live_val = float(envalert_fallback[pollutant]["value"])
+                live_aqi = int(envalert_fallback[pollutant]["aqi"])
+                category, warning, color = get_category_info(live_aqi)
+                results = []
+                today_date = datetime.now(IST).date()
+                for i in range(start_day, 7):
+                    day_date = today_date + timedelta(days=i)
+                    day = "Today" if i == 0 else "Tomorrow" if i == 1 else day_date.strftime("%d %b")
+                    results.append({
+                        "day": day,
+                        "date": day_date.strftime("%Y-%m-%d"),
+                        "value": round(live_val, 2),
+                        "aqi": live_aqi,
+                        "category": category,
+                        "warning": warning,
+                        "color": color
+                    })
+                print(f"[predict_pollutant] {pollutant}: EnvAlert persistence fallback (live={live_val})", flush=True)
+                return results
+            print(f"[predict_pollutant] {pollutant}: no data (len={len(data)}) and no EnvAlert fallback", flush=True)
             return []
 
         # Latest weather features
@@ -791,7 +818,8 @@ def predict():
                 pol_data,
                 weather_data,
                 ts_series,
-                start_day=0
+                start_day=0,
+                envalert_fallback=envalert_today_data
             )
 
             result[pollutant] = prediction
@@ -862,31 +890,39 @@ def predict():
 
         # 🌍 Overall AQI (excluding O3)
         overall_daily_aqi = []
-        for i in range(7):
-            daily_values = []
-            for p in TARGET_POLLUTANTS:
-                if p != "o3" and len(result.get(p, [])) > i:
-                    daily_values.append({
-                        "pollutant": p,
-                        "aqi": result[p][i]["aqi"],
-                        "value": result[p][i]["value"],
-                        "category": result[p][i]["category"],
-                        "warning": result[p][i]["warning"],
-                        "color": result[p][i]["color"]
-                    })
+        # Find any pollutant that has predictions to use for day/date labels
+        label_pollutant = next(
+            (p for p in TARGET_POLLUTANTS if result.get(p)), None
+        )
+        if not label_pollutant:
+            print("[predict] No predictions available for any pollutant — returning empty forecast", flush=True)
+        else:
+            num_days = len(result[label_pollutant])
+            for i in range(num_days):
+                daily_values = []
+                for p in TARGET_POLLUTANTS:
+                    if p != "o3" and len(result.get(p, [])) > i:
+                        daily_values.append({
+                            "pollutant": p,
+                            "aqi": result[p][i]["aqi"],
+                            "value": result[p][i]["value"],
+                            "category": result[p][i]["category"],
+                            "warning": result[p][i]["warning"],
+                            "color": result[p][i]["color"]
+                        })
 
-            if daily_values:
-                highest = max(daily_values, key=lambda x: x["aqi"])
-                overall_daily_aqi.append({
-                    "day": result[TARGET_POLLUTANTS[0]][i]["day"],
-                    "date": result[TARGET_POLLUTANTS[0]][i]["date"],
-                    "main_pollutant": highest["pollutant"],
-                    "value": highest["value"],
-                    "aqi": highest["aqi"],
-                    "category": highest["category"],
-                    "warning": highest["warning"],
-                    "color": highest["color"]
-                })
+                if daily_values:
+                    highest = max(daily_values, key=lambda x: x["aqi"])
+                    overall_daily_aqi.append({
+                        "day": result[label_pollutant][i]["day"],
+                        "date": result[label_pollutant][i]["date"],
+                        "main_pollutant": highest["pollutant"],
+                        "value": highest["value"],
+                        "aqi": highest["aqi"],
+                        "category": highest["category"],
+                        "warning": highest["warning"],
+                        "color": highest["color"]
+                    })
 
         return jsonify({
             "city": city_name,
@@ -896,7 +932,8 @@ def predict():
             "errors": errors,
             "env_source": env_source,   # 🔥 city / nearest_city_fallback
             "lat": lat,
-            "lon": lon
+            "lon": lon,
+            "data_available": bool(overall_daily_aqi)
         })
 
     except Exception as e:
@@ -955,8 +992,10 @@ def weather_forecast():
                 print(f"[weather] attempt {_attempt+1} failed: {_e}", flush=True)
                 time.sleep(1)
 
-        if not daily_data:
-            return jsonify({"error": "Weather service unavailable"}), 503
+        if not daily_data or daily_data.get("error"):
+            reason = daily_data.get("reason", "unknown") if daily_data else "no response"
+            print(f"[weather] daily forecast unavailable: {reason}", flush=True)
+            return jsonify({"error": f"Weather service unavailable: {reason}"}), 503
 
         daily = daily_data.get("daily", {})
         current = current_data.get("current", {}) if current_data else {}
@@ -1065,6 +1104,7 @@ def predict_grid():
         center_pol_results = {}
         for _pol in TARGET_POLLUTANTS:
             center_pol_results[_pol] = fetch_pollutant_series(center_lat, center_lon, _pol)
+        center_envalert = get_today_data_from_envalert(city_name)
         print(f"[predict_grid] City center data pre-fetched for {city_name}", flush=True)
 
         def predict_aqi_for_point(point):
@@ -1073,8 +1113,6 @@ def predict_grid():
             try:
                 # Reuse city center weather & pollutant data for all grid points
                 weather_data = center_weather
-                if not weather_data:
-                    return {"lat": pt_lat, "lon": pt_lon, "aqi": None, "error": "no_weather"}
 
                 pol_results = center_pol_results
 
@@ -1088,7 +1126,8 @@ def predict_grid():
 
                     pol_data, ts_series = pol_results.get(pollutant, ([], []))
                     prediction = predict_pollutant(
-                        pollutant, pol_data, weather_data, ts_series, start_day=0
+                        pollutant, pol_data, weather_data, ts_series, start_day=0,
+                        envalert_fallback=center_envalert
                     )
 
                     if prediction and len(prediction) > 0:
@@ -1457,14 +1496,15 @@ def monthly_average():
 # ── LLM Chat Route (Gemini) ───────────────────────────────────────────────
 # Requires: pip install google-generativeai python-dotenv
 
-import google.generativeai as genai
+import google.genai as genai
+from google.genai import types as genai_types
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
 # Configure Gemini API Key
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+_genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
 def chat():
@@ -1566,8 +1606,10 @@ def chat():
         reply = None
         for model_name in GEMINI_MODELS:
             try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(full_prompt)
+                response = _genai_client.models.generate_content(
+                    model=model_name,
+                    contents=full_prompt
+                )
                 reply = response.text
                 print(f"[/api/chat] Used model: {model_name}", flush=True)
                 break
@@ -1597,8 +1639,7 @@ def chat():
 @app.route('/debug_models', methods=['GET'])
 def debug_models():
     try:
-        available = [m.name for m in genai.list_models() 
-                     if 'generateContent' in m.supported_generation_methods]
+        available = [m.name for m in _genai_client.models.list()]
         return jsonify({"models": available})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
