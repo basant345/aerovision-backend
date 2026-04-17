@@ -443,16 +443,43 @@ def get_today_data_from_envalert(city_name):
         print(f"Error in get_today_data_from_envalert: {e}", flush=True)
         return None
 
-_openmeteo_cache = {}
+import json
+
 _OPENMETEO_TTL = 3600  # 1 hour
+_OPENMETEO_CACHE_DIR = "/tmp/openmeteo_cache"
+os.makedirs(_OPENMETEO_CACHE_DIR, exist_ok=True)
+
+def _om_cache_path(cache_key):
+    return os.path.join(_OPENMETEO_CACHE_DIR, f"{cache_key}.json")
+
+def _om_cache_read(cache_key):
+    """Read from disk cache. Returns data if fresh, else None."""
+    path = _om_cache_path(cache_key)
+    try:
+        with open(path, "r") as f:
+            entry = json.load(f)
+        if time.time() - entry["ts"] < _OPENMETEO_TTL:
+            print(f"[OpenMeteo] Disk cache hit for {cache_key}", flush=True)
+            return entry["data"]
+    except Exception:
+        pass
+    return None
+
+def _om_cache_write(cache_key, data):
+    """Write to disk cache."""
+    path = _om_cache_path(cache_key)
+    try:
+        with open(path, "w") as f:
+            json.dump({"data": data, "ts": time.time()}, f)
+    except Exception as e:
+        print(f"[OpenMeteo] Disk cache write failed: {e}", flush=True)
 
 def fetch_all_pollutant_series(lat, lon):
-    """Fetch ALL 6 pollutants in ONE API call and cache for 1 hour."""
+    """Fetch ALL 6 pollutants in ONE API call. Disk-cached for 1 hour (survives restarts)."""
     cache_key = f"{round(lat,3)}_{round(lon,3)}"
-    now = time.time()
-    if cache_key in _openmeteo_cache and (now - _openmeteo_cache[cache_key]["ts"]) < _OPENMETEO_TTL:
-        print(f"[OpenMeteo] Serving from cache for {cache_key}", flush=True)
-        return _openmeteo_cache[cache_key]["data"]
+    cached = _om_cache_read(cache_key)
+    if cached is not None:
+        return cached
     all_fields = ",".join(POLLUTANT_API_MAP.values())
     url = (
         f"https://air-quality-api.open-meteo.com/v1/air-quality"
@@ -470,8 +497,8 @@ def fetch_all_pollutant_series(lat, lon):
             if "hourly" not in data:
                 print(f"[OpenMeteo] No 'hourly' key. Keys: {list(data.keys())}", flush=True)
                 return None
-            _openmeteo_cache[cache_key] = {"data": data["hourly"], "ts": now}
-            print(f"[OpenMeteo] Fetched all pollutants for {cache_key} (attempt {_attempt+1})", flush=True)
+            _om_cache_write(cache_key, data["hourly"])
+            print(f"[OpenMeteo] Fetched & cached all pollutants for {cache_key} (attempt {_attempt+1})", flush=True)
             return data["hourly"]
         except Exception as _e:
             print(f"[OpenMeteo] Attempt {_attempt+1} failed: {_e}", flush=True)
@@ -1033,21 +1060,23 @@ def predict_grid():
 
         print(f"📍 Generated {len(points)} grid points", flush=True)
 
+        # Pre-fetch city center data ONCE — all grid points reuse it (saves 54 API calls)
+        center_weather = fetch_weather_series(center_lat, center_lon)
+        center_pol_results = {}
+        for _pol in TARGET_POLLUTANTS:
+            center_pol_results[_pol] = fetch_pollutant_series(center_lat, center_lon, _pol)
+        print(f"[predict_grid] City center data pre-fetched for {city_name}", flush=True)
+
         def predict_aqi_for_point(point):
             pt_lat = point["lat"]
             pt_lon = point["lon"]
             try:
-                # Fetch weather data for this point
-                weather_data = fetch_weather_series(pt_lat, pt_lon)
+                # Reuse city center weather & pollutant data for all grid points
+                weather_data = center_weather
                 if not weather_data:
                     return {"lat": pt_lat, "lon": pt_lon, "aqi": None, "error": "no_weather"}
 
-                # Fetch all 6 pollutant series in parallel
-                def fetch_pol(pollutant):
-                    return pollutant, fetch_pollutant_series(pt_lat, pt_lon, pollutant)
-
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    pol_results = dict(ex.map(fetch_pol, TARGET_POLLUTANTS))
+                pol_results = center_pol_results
 
                 # Run CNN model for each pollutant, collect today's AQI
                 daily_aqis = []
@@ -1291,36 +1320,44 @@ def monthly_average():
         end_date = datetime.now(IST).date()
         start_date = end_date - timedelta(days=29)
 
-        results = {}
-        for pollutant, api_field in POLLUTANT_API_MAP.items():
-            url = (
+        # Fetch all 6 pollutants in ONE call, disk-cached (survives restarts)
+        all_fields = ",".join(POLLUTANT_API_MAP.values())
+        ma_cache_key = f"monthly_{round(lat,3)}_{round(lon,3)}_{start_date}_{end_date}"
+        ma_hourly = _om_cache_read(ma_cache_key)
+        if ma_hourly is None:
+            ma_url = (
                 f"https://air-quality-api.open-meteo.com/v1/air-quality"
                 f"?latitude={lat}&longitude={lon}"
                 f"&start_date={start_date}&end_date={end_date}"
-                f"&hourly={api_field}&timezone=Asia%2FKolkata"
+                f"&hourly={all_fields}&timezone=Asia%2FKolkata"
             )
-            try:
-                resp = None
-                for _ma_attempt in range(3):
-                    try:
-                        resp = requests.get(url, timeout=20)
-                        break
-                    except Exception as _mae:
-                        print(f"[monthly_average] attempt {_ma_attempt+1} failed: {_mae}", flush=True)
-                        time.sleep(1)
-                if resp is None:
-                    continue
-                d = resp.json()
+            ma_resp = None
+            for _ma_attempt in range(3):
+                try:
+                    ma_resp = requests.get(ma_url, timeout=20)
+                    break
+                except Exception as _mae:
+                    print(f"[monthly_average] attempt {_ma_attempt+1} failed: {_mae}", flush=True)
+                    time.sleep(1)
+            if ma_resp is not None:
+                d = ma_resp.json()
                 if d.get("error"):
-                    print(f"[monthly_average] {pollutant} API error: {d.get('reason', 'unknown')}", flush=True)
+                    print(f"[monthly_average] API error: {d.get('reason', 'unknown')}", flush=True)
+                elif "hourly" not in d:
+                    print(f"[monthly_average] no 'hourly' key. Keys: {list(d.keys())}", flush=True)
+                else:
+                    ma_hourly = d["hourly"]
+                    _om_cache_write(ma_cache_key, ma_hourly)
+                    print(f"[monthly_average] Fetched & cached all pollutants for {city_name}", flush=True)
+
+        results = {}
+        for pollutant, api_field in POLLUTANT_API_MAP.items():
+            try:
+                if ma_hourly is None:
                     results[pollutant] = []
                     continue
-                if "hourly" not in d:
-                    print(f"[monthly_average] {pollutant} no 'hourly' key. Keys: {list(d.keys())}", flush=True)
-                    results[pollutant] = []
-                    continue
-                hourly_values = d["hourly"].get(api_field, [])
-                hourly_times  = d["hourly"].get("time", [])
+                hourly_values = ma_hourly.get(api_field, [])
+                hourly_times  = ma_hourly.get("time", [])
 
                 # Group by date and compute daily average
                 daily = {}
