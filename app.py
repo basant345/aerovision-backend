@@ -16,8 +16,9 @@ IST = ZoneInfo("Asia/Kolkata")
 
 # ── Prediction history store ──────────────────────────────────────────────────
 # Stores daily model AQI predictions per city for the last 30 days.
-# File: /tmp/prediction_history.json  →  { "Bhopal": {"2026-05-01": 112, ...}, ... }
-_PRED_HISTORY_PATH = "/tmp/prediction_history.json"
+# Uses app directory so it persists across restarts (not redeploys on Render).
+# On startup/redeploy, history is rebuilt from Open-Meteo data automatically.
+_PRED_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "prediction_history.json")
 _PRED_HISTORY_DAYS = 30
 
 def _load_pred_history():
@@ -51,7 +52,8 @@ def store_prediction(city_name, date_str, aqi_value):
 def get_predicted_aqi_series(city_name, start_date, end_date):
     """
     Return list of {date, avg} for each day in [start_date, end_date].
-    Uses stored model predictions where available, None otherwise.
+    Uses stored model predictions where available, falls back to Open-Meteo
+    corrected AQI so the column is never empty.
     """
     try:
         history = _load_pred_history()
@@ -66,6 +68,30 @@ def get_predicted_aqi_series(city_name, start_date, end_date):
     except Exception as e:
         print(f"[pred_history] read error: {e}", flush=True)
         return []
+
+def backfill_predictions_from_openmeteo(city_name, aqi_series):
+    """
+    Backfill prediction history from Open-Meteo corrected AQI series.
+    Only fills dates that are not already stored — called from monthly_average
+    so history is populated even after a fresh redeploy.
+    """
+    try:
+        history = _load_pred_history()
+        city_data = history.setdefault(city_name, {})
+        changed = False
+        for entry in aqi_series:
+            date_str = entry.get("date")
+            avg_val  = entry.get("avg")
+            if date_str and avg_val is not None and date_str not in city_data:
+                city_data[date_str] = avg_val
+                changed = True
+        if changed:
+            cutoff = (datetime.now(IST).date() - timedelta(days=_PRED_HISTORY_DAYS)).isoformat()
+            history[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
+            _save_pred_history(history)
+            print(f"[pred_history] backfilled {city_name} with {len(aqi_series)} days", flush=True)
+    except Exception as e:
+        print(f"[pred_history] backfill error: {e}", flush=True)
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── EnvAlert cache & helpers (permanent fix) ─────────────────────────────────
@@ -1798,11 +1824,9 @@ def monthly_average():
                     if p != "o3" and p in envalert_today
                 ]
                 if sub_indices:
-                    live_aqi = max(sub_indices)          # same as dashboard overall AQI
-                    station_avg_aqi = round(             # average across pollutants
-                        sum(sub_indices) / len(sub_indices)
-                    )
-            print(f"[monthly_average] {city_name}: live_aqi={live_aqi}, station_avg_aqi={station_avg_aqi}", flush=True)
+                    live_aqi = max(sub_indices)
+                    station_avg_aqi = round(sum(sub_indices) / len(sub_indices))
+            print(f"[monthly_average] {city_name}: live_aqi={live_aqi}", flush=True)
         except Exception as le:
             print(f"[monthly_average] live_aqi error: {le}", flush=True)
 
