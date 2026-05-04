@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import os
+import json
 import numpy as np
 import requests
 from datetime import datetime, timedelta
@@ -12,6 +13,60 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 
 IST = ZoneInfo("Asia/Kolkata")
+
+# ── Prediction history store ──────────────────────────────────────────────────
+# Stores daily model AQI predictions per city for the last 30 days.
+# File: /tmp/prediction_history.json  →  { "Bhopal": {"2026-05-01": 112, ...}, ... }
+_PRED_HISTORY_PATH = "/tmp/prediction_history.json"
+_PRED_HISTORY_DAYS = 30
+
+def _load_pred_history():
+    try:
+        with open(_PRED_HISTORY_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_pred_history(history):
+    try:
+        with open(_PRED_HISTORY_PATH, "w") as f:
+            json.dump(history, f)
+    except Exception as e:
+        print(f"[pred_history] save error: {e}", flush=True)
+
+def store_prediction(city_name, date_str, aqi_value):
+    """Store today's model AQI prediction for a city. Keeps only last 30 days."""
+    try:
+        history = _load_pred_history()
+        city_data = history.setdefault(city_name, {})
+        city_data[date_str] = aqi_value
+        # Prune entries older than 30 days
+        cutoff = (datetime.now(IST).date() - timedelta(days=_PRED_HISTORY_DAYS)).isoformat()
+        history[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
+        _save_pred_history(history)
+        print(f"[pred_history] stored {city_name} {date_str}={aqi_value}", flush=True)
+    except Exception as e:
+        print(f"[pred_history] store error: {e}", flush=True)
+
+def get_predicted_aqi_series(city_name, start_date, end_date):
+    """
+    Return list of {date, avg} for each day in [start_date, end_date].
+    Uses stored model predictions where available, None otherwise.
+    """
+    try:
+        history = _load_pred_history()
+        city_data = history.get(city_name, {})
+        series = []
+        current = start_date
+        while current <= end_date:
+            date_str = current.isoformat()
+            series.append({"date": date_str, "avg": city_data.get(date_str)})
+            current += timedelta(days=1)
+        return series
+    except Exception as e:
+        print(f"[pred_history] read error: {e}", flush=True)
+        return []
+# ─────────────────────────────────────────────────────────────────────────────
 
 # ── EnvAlert cache & helpers (permanent fix) ─────────────────────────────────
 _envalert_cache = {"data": None, "ts": 0}
@@ -443,8 +498,6 @@ def get_today_data_from_envalert(city_name):
         print(f"Error in get_today_data_from_envalert: {e}", flush=True)
         return None
 
-import json
-
 _OPENMETEO_TTL = 3600  # 1 hour
 _OPENMETEO_CACHE_DIR = "/tmp/openmeteo_cache"
 os.makedirs(_OPENMETEO_CACHE_DIR, exist_ok=True)
@@ -783,6 +836,105 @@ def getAvgOfAllStationsValues():
         return None
 
 
+def get_avg_aqi_from_stations():
+    """
+    Compute the average AQI across all EnvAlert stations that report a valid AQI value.
+    Returns a rounded integer or None if no valid data is available.
+    """
+    try:
+        stations = fetch_envalert_all_with_cache()
+        if not stations or not isinstance(stations, list):
+            return None
+
+        aqi_values = []
+        for station in stations:
+            aqi_raw = station.get("aqi") or station.get("AQI")
+            if aqi_raw in (None, "", "null", "NULL", "ID"):
+                continue
+            try:
+                aqi_val = float(str(aqi_raw).strip())
+                if 0 < aqi_val <= 500:
+                    aqi_values.append(aqi_val)
+            except (ValueError, TypeError):
+                continue
+
+        if not aqi_values:
+            return None
+
+        avg = round(sum(aqi_values) / len(aqi_values))
+        print(f"[get_avg_aqi_from_stations] avg={avg} from {len(aqi_values)} stations", flush=True)
+        return avg
+
+    except Exception as e:
+        print(f"[get_avg_aqi_from_stations] Error: {e}", flush=True)
+        return None
+
+
+def get_city_station_avg_aqi(city_name):
+    """
+    Compute the average AQI from only the active stations belonging to the given city.
+    Uses the AQI field reported directly by each station in the EnvAlert API.
+    Returns a rounded integer or None if no valid data is available.
+    """
+    try:
+        # Resolve city key (case-insensitive)
+        city_key = None
+        for key in CITY_STATIONS:
+            if key.lower() == city_name.lower():
+                city_key = key
+                break
+        if not city_key:
+            print(f"[get_city_station_avg_aqi] City '{city_name}' not in CITY_STATIONS", flush=True)
+            return None
+
+        station_ids = set(str(sid) for sid in CITY_STATIONS[city_key])
+
+        all_stations = fetch_envalert_all_with_cache()
+        if not all_stations or not isinstance(all_stations, list):
+            return None
+
+        aqi_values = []
+        for station in all_stations:
+            sid = str(station.get("station_id", "")).strip()
+            if sid not in station_ids:
+                continue
+
+            # Try direct AQI field first
+            aqi_raw = station.get("aqi") or station.get("AQI")
+
+            # Fallback: compute from pm25 sub-index if no direct AQI
+            if aqi_raw in (None, "", "null", "NULL", "ID"):
+                pm25_raw = station.get("pm25")
+                if pm25_raw not in (None, "", "null", "ID"):
+                    try:
+                        aqi_raw = get_aqi_sub_index(float(str(pm25_raw).strip()), "pm2_5")
+                    except Exception:
+                        pass
+
+            if aqi_raw in (None, "", "null", "NULL", "ID"):
+                continue
+
+            try:
+                aqi_val = float(str(aqi_raw).strip())
+                if 0 < aqi_val <= 500:
+                    aqi_values.append(aqi_val)
+                    print(f"[get_city_station_avg_aqi] {city_key} station {sid}: AQI={aqi_val}", flush=True)
+            except (ValueError, TypeError):
+                continue
+
+        if not aqi_values:
+            print(f"[get_city_station_avg_aqi] No valid AQI data for {city_key}", flush=True)
+            return None
+
+        avg = round(sum(aqi_values) / len(aqi_values))
+        print(f"[get_city_station_avg_aqi] {city_key}: avg={avg} from {len(aqi_values)} active stations", flush=True)
+        return avg
+
+    except Exception as e:
+        print(f"[get_city_station_avg_aqi] Error: {e}", flush=True)
+        return None
+
+
 @app.route('/predict', methods=['POST', 'OPTIONS'])
 def predict():
     if request.method == 'OPTIONS':
@@ -941,6 +1093,15 @@ def predict():
                         "warning": highest["warning"],
                         "color": highest["color"]
                     })
+
+        # 💾 Store today's model prediction for historical stats
+        try:
+            today_date_str = datetime.now(IST).date().isoformat()
+            today_overall = next((e for e in overall_daily_aqi if e.get("day") == "Today"), None)
+            if today_overall and today_overall.get("aqi"):
+                store_prediction(city_name, today_date_str, today_overall["aqi"])
+        except Exception as _spe:
+            print(f"[pred_history] failed to store: {_spe}", flush=True)
 
         return jsonify({
             "city": city_name,
@@ -1487,12 +1648,27 @@ def monthly_average():
                     except Exception:
                         aqi_series.append({"date": entry["date"], "avg": None})
 
+                # Build per-day station AQI series from all pollutant estimates
+                # Today: live from city's active stations; past days: average of sub-indices
+                station_aqi_series_fb = []
+                live_station_avg_fb = get_city_station_avg_aqi(city_name)
+                today_str_fb = end_date.strftime("%Y-%m-%d")
+                for entry in aqi_series:
+                    date_str = entry["date"]
+                    if date_str == today_str_fb and live_station_avg_fb is not None:
+                        station_aqi_series_fb.append({"date": date_str, "avg": live_station_avg_fb})
+                    else:
+                        # Use the same value as aqi_series for fallback (no better data available)
+                        station_aqi_series_fb.append({"date": date_str, "avg": entry.get("avg")})
+
                 return jsonify({
                     "city": city_name,
                     "start_date": str(start_date),
                     "end_date": str(end_date),
                     "aqi": aqi_series,
                     "pollutants": results,
+                    "live_aqi": live_station_avg_fb,
+                    "station_aqi_series": station_aqi_series_fb,
                     "source": "envalert_estimate"
                 })
             else:
@@ -1503,6 +1679,8 @@ def monthly_average():
                     "end_date": str(end_date),
                     "aqi": [],
                     "pollutants": {p: [] for p in TARGET_POLLUTANTS},
+                    "live_aqi": None,
+                    "station_aqi_series": [],
                     "error": "Historical data temporarily unavailable. OpenMeteo API limit reached."
                 }), 503
 
@@ -1531,21 +1709,32 @@ def monthly_average():
                 print(f"[monthly_average] {pollutant} error: {e}", flush=True)
                 results[pollutant] = []
 
-        # Compute daily overall AQI from pm2_5 daily averages
+        # Compute daily overall AQI as max sub-index across all pollutants (excluding o3)
+        # This matches exactly how the dashboard /predict computes overall AQI
         import math
         aqi_series_raw = []
-        for entry in results.get("pm2_5", []):
+        # Collect all dates from pm2_5 as reference axis
+        ref_dates = [e["date"] for e in results.get("pm2_5", [])]
+        for date_str in ref_dates:
             try:
-                avg_val = entry.get("avg")
-                if avg_val is None:
-                    aqi_series_raw.append({"date": entry["date"], "avg": None})
+                day_sub_indices = []
+                for pollutant in TARGET_POLLUTANTS:
+                    if pollutant == "o3":
+                        continue  # excluded from overall AQI, same as /predict
+                    day_entry = next(
+                        (e for e in results.get(pollutant, []) if e["date"] == date_str), None
+                    )
+                    if day_entry and day_entry.get("avg") is not None:
+                        si = get_aqi_sub_index(float(day_entry["avg"]), pollutant)
+                        if si and not math.isnan(float(si)):
+                            day_sub_indices.append(si)
+                if day_sub_indices:
+                    aqi_series_raw.append({"date": date_str, "avg": round(max(day_sub_indices))})
                 else:
-                    aqi_val = get_aqi_sub_index(float(avg_val), "pm2_5")
-                    safe = round(aqi_val) if (aqi_val and not math.isnan(float(aqi_val))) else None
-                    aqi_series_raw.append({"date": entry["date"], "avg": safe})
+                    aqi_series_raw.append({"date": date_str, "avg": None})
             except Exception as ex:
-                print(f"[monthly_average] AQI calc error: {ex}", flush=True)
-                aqi_series_raw.append({"date": entry["date"], "avg": None})
+                print(f"[monthly_average] AQI calc error for {date_str}: {ex}", flush=True)
+                aqi_series_raw.append({"date": date_str, "avg": None})
 
         # Apply correction factor: align Open-Meteo AQI to EnvAlert real sensor AQI
         correction = 0
@@ -1597,12 +1786,65 @@ def monthly_average():
         except Exception as pe:
             print(f"[monthly_average] pollutant correction error: {pe}", flush=True)
 
+        # ── Live AQI from EnvAlert (same method as dashboard /predict) ────────────
+        # Dashboard AQI = max(sub-indices across pm2.5, pm10, no2, so2, co) from EnvAlert stations
+        live_aqi = None
+        station_avg_aqi = None
+        try:
+            if envalert_today:
+                sub_indices = [
+                    envalert_today[p]["aqi"]
+                    for p in TARGET_POLLUTANTS
+                    if p != "o3" and p in envalert_today
+                ]
+                if sub_indices:
+                    live_aqi = max(sub_indices)          # same as dashboard overall AQI
+                    station_avg_aqi = round(             # average across pollutants
+                        sum(sub_indices) / len(sub_indices)
+                    )
+            print(f"[monthly_average] {city_name}: live_aqi={live_aqi}, station_avg_aqi={station_avg_aqi}", flush=True)
+        except Exception as le:
+            print(f"[monthly_average] live_aqi error: {le}", flush=True)
+
+        # ── Build station_aqi_series ─────────────────────────────────────────────
+        # Today → live_aqi (real EnvAlert reading, same as dashboard)
+        # Past days → AVERAGE of sub-indices across pollutants (different from aqi_series which uses MAX)
+        today_str = datetime.now(IST).date().strftime("%Y-%m-%d")
+        station_aqi_series = []
+        for entry in aqi_series:
+            if entry["date"] == today_str and live_aqi is not None:
+                station_aqi_series.append({"date": entry["date"], "avg": live_aqi})
+            else:
+                # Compute average of sub-indices for this day (different from aqi_series max)
+                day_sub_indices = []
+                for pollutant in TARGET_POLLUTANTS:
+                    if pollutant == "o3":
+                        continue
+                    day_entry = next(
+                        (e for e in results.get(pollutant, []) if e["date"] == entry["date"]), None
+                    )
+                    if day_entry and day_entry.get("avg") is not None:
+                        try:
+                            si = get_aqi_sub_index(float(day_entry["avg"]), pollutant)
+                            if si and not math.isnan(float(si)) and 0 < si <= 500:
+                                day_sub_indices.append(si)
+                        except Exception:
+                            pass
+                if day_sub_indices:
+                    avg_val = max(0, min(500, round(sum(day_sub_indices) / len(day_sub_indices))))
+                    station_aqi_series.append({"date": entry["date"], "avg": avg_val})
+                else:
+                    station_aqi_series.append({"date": entry["date"], "avg": entry.get("avg")})
+
         return jsonify({
             "city": city_name,
             "start_date": str(start_date),
             "end_date": str(end_date),
             "aqi": aqi_series,
-            "pollutants": results
+            "pollutants": results,
+            "live_aqi": live_aqi,
+            "station_aqi_series": station_aqi_series,
+            "predicted_aqi_series": get_predicted_aqi_series(city_name, start_date, end_date),
         })
 
     except Exception as e:
