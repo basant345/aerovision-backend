@@ -15,9 +15,6 @@ import time
 IST = ZoneInfo("Asia/Kolkata")
 
 # ── Prediction history store ──────────────────────────────────────────────────
-# Stores daily model AQI predictions per city for the last 30 days.
-# Uses app directory so it persists across restarts (not redeploys on Render).
-# On startup/redeploy, history is rebuilt from Open-Meteo data automatically.
 _PRED_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "prediction_history.json")
 _PRED_HISTORY_DAYS = 30
 
@@ -41,7 +38,6 @@ def store_prediction(city_name, date_str, aqi_value):
         history = _load_pred_history()
         city_data = history.setdefault(city_name, {})
         city_data[date_str] = aqi_value
-        # Prune entries older than 30 days
         cutoff = (datetime.now(IST).date() - timedelta(days=_PRED_HISTORY_DAYS)).isoformat()
         history[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
         _save_pred_history(history)
@@ -50,11 +46,6 @@ def store_prediction(city_name, date_str, aqi_value):
         print(f"[pred_history] store error: {e}", flush=True)
 
 def get_predicted_aqi_series(city_name, start_date, end_date):
-    """
-    Return list of {date, avg} for each day in [start_date, end_date].
-    Uses stored model predictions where available, falls back to Open-Meteo
-    corrected AQI so the column is never empty.
-    """
     try:
         history = _load_pred_history()
         city_data = history.get(city_name, {})
@@ -70,11 +61,6 @@ def get_predicted_aqi_series(city_name, start_date, end_date):
         return []
 
 def backfill_predictions_from_openmeteo(city_name, aqi_series):
-    """
-    Backfill prediction history from Open-Meteo corrected AQI series.
-    Only fills dates that are not already stored — called from monthly_average
-    so history is populated even after a fresh redeploy.
-    """
     try:
         history = _load_pred_history()
         city_data = history.setdefault(city_name, {})
@@ -92,11 +78,10 @@ def backfill_predictions_from_openmeteo(city_name, aqi_series):
             print(f"[pred_history] backfilled {city_name} with {len(aqi_series)} days", flush=True)
     except Exception as e:
         print(f"[pred_history] backfill error: {e}", flush=True)
-# ─────────────────────────────────────────────────────────────────────────────
 
-# ── EnvAlert cache & helpers (permanent fix) ─────────────────────────────────
+# ── EnvAlert cache & helpers ──────────────────────────────────────────────────
 _envalert_cache = {"data": None, "ts": 0}
-_CACHE_TTL = 300  # 5 minutes — serve cached data if EnvAlert blocks
+_CACHE_TTL = 300
 
 ENVALERT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -108,7 +93,6 @@ ENVALERT_HEADERS = {
 }
 
 def fetch_envalert_all_with_cache():
-    """Fetch ALL stations with Indian headers, 3 retries, 5-min cache."""
     now = time.time()
     if _envalert_cache["data"] and (now - _envalert_cache["ts"]) < _CACHE_TTL:
         print("[EnvAlert] Serving from cache", flush=True)
@@ -135,16 +119,12 @@ def fetch_envalert_all_with_cache():
     print(f"[EnvAlert] All retries failed, no cache: {last_err}", flush=True)
     return None
 
-
 def fetch_envalert_station_with_retry(station_id):
-    """Fetch single station — first from ALL cache, then individual with retry."""
-    # Try cache first — avoids individual station blocks entirely
     cached = fetch_envalert_all_with_cache()
     if cached:
         for st in cached:
             if str(st.get("station_id")) == str(station_id):
                 return st
-    # Fallback: individual fetch with Indian headers
     url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
     for attempt in range(3):
         try:
@@ -159,8 +139,6 @@ def fetch_envalert_station_with_retry(station_id):
             time.sleep(1)
     return None
 
-
-# Hardcoded MP city coordinates — instant, no API needed
 MP_CITY_COORDS = {
     "Indore": (22.7196, 75.8577), "Bhopal": (23.2599, 77.4126),
     "Jabalpur": (23.1815, 79.9864), "Gwalior": (26.2183, 78.1828),
@@ -187,17 +165,12 @@ MP_CITY_COORDS = {
     "Narmadapuram": (22.7533, 77.7125), "Vidisha": (23.5251, 77.8082),
     "Sehore": (23.2006, 77.0845), "CTSDF": (23.2599, 77.4126),
 }
-# ─────────────────────────────────────────────────────────────────────────────
 
-
-# Disable GPU for CPU inference
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 app = Flask(__name__)
-# Allow all origins for React Native app compatibility
-# React Native doesn't send traditional browser origins
-CORS(app, 
+CORS(app,
      resources={r"/*": {
          "origins": ["https://airqualitycities.iiti.ac.in", "http://localhost:8080", "https://erc.mp.gov.in"],
          "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
@@ -208,8 +181,6 @@ CORS(app,
 )
 
 api_key = "701cf10ad3df9b6f5f58f40bfba7e837"
-
-# Add after_request handler to ensure CORS headers
 
 TARGET_POLLUTANTS = ["pm2_5", "pm10", "no2", "so2", "o3", "co"]
 
@@ -222,7 +193,6 @@ POLLUTANT_API_MAP = {
     "co": "carbon_monoxide"
 }
 
-# City to Station ID mapping
 CITY_STATIONS = {
     "Anuppur": [18],
     "Betul": [22],
@@ -250,11 +220,10 @@ CITY_STATIONS = {
     "Ujjain": [2]
 }
 
-# EnvAlert API pollutant mapping to API response keys
 ENVALERT_POLLUTANT_MAP = {
     "pm2_5": ("pm25", "pm25_subindex"),
     "pm10": ("pm10", "pm10_subindex"),
-    "no2": ("nox", "nox_subindex"),  # NOx is used as NO2 proxy
+    "no2": ("nox", "nox_subindex"),
     "so2": ("so2", "so2_subindex"),
     "o3": ("ozone", "ozone_subindex"),
     "co": ("co", "co_subindex")
@@ -284,8 +253,6 @@ AQI_CATEGORIES = {
     (401, 500): 'Severe'
 }
 
-
-# new added
 from math import radians, cos, sin, asin, sqrt
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -294,11 +261,8 @@ def haversine(lat1, lon1, lat2, lon2):
     dlon = lon2 - lon1
     a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
     c = 2 * asin(sqrt(a))
-    return 6371 * c  # km
+    return 6371 * c
 
-
-
-# new added
 @lru_cache(maxsize=100)
 def get_city_latlon(city):
     return get_city_coordinates(city)
@@ -307,60 +271,45 @@ def find_nearest_city(city_name):
     base_lat, base_lon = get_city_coordinates(city_name)
     if not base_lat:
         return None
-
     nearest_city = None
     min_dist = float("inf")
-
     for city in CITY_STATIONS.keys():
         if city.lower() == city_name.lower():
             continue
-
         lat, lon = get_city_latlon(city)
         if not lat:
             continue
-
         dist = haversine(base_lat, base_lon, lat, lon)
         if dist < min_dist:
             min_dist = dist
             nearest_city = city
-
     return nearest_city
 
-# new added
 def get_fallback_data_from_nearest_city(city_name):
     nearest_city = find_nearest_city(city_name)
-
     if not nearest_city:
         print("❌ No nearest city found", flush=True)
         return None
-
     print(f"⚠ Using fallback city: {nearest_city}", flush=True)
-
-    station_ids = CITY_STATIONS[nearest_city][:2]  # only 2 stations
-
+    station_ids = CITY_STATIONS[nearest_city][:2]
     pollutant_values = {p: [] for p in TARGET_POLLUTANTS}
     pollutant_aqis = {p: [] for p in TARGET_POLLUTANTS}
-
     for station_id in station_ids:
         data = fetch_envalert_current_aqi(station_id)
         if not data:
             continue
-
         for pollutant in TARGET_POLLUTANTS:
             value_key, aqi_key = ENVALERT_POLLUTANT_MAP[pollutant]
-
             try:
                 val = float(data.get(value_key))
                 pollutant_values[pollutant].append(val)
             except:
                 pass
-
             try:
                 aqi = float(data.get(aqi_key))
                 pollutant_aqis[pollutant].append(aqi)
             except:
                 pass
-
     result = {}
     for p in TARGET_POLLUTANTS:
         if pollutant_values[p]:
@@ -368,9 +317,7 @@ def get_fallback_data_from_nearest_city(city_name):
                 "value": round(sum(pollutant_values[p]) / len(pollutant_values[p]), 2),
                 "aqi": round(sum(pollutant_aqis[p]) / len(pollutant_aqis[p]), 0)
             }
-
     return result if result else None
-
 
 def get_aqi_sub_index(C, pollutant):
     if pd.isna(C): return np.nan
@@ -395,12 +342,10 @@ def get_category_info(aqi):
             return cat, f"{cat} air quality.", color_map.get(cat, "gray")
     return "Out of Range", "AQI beyond measurable limits.", "gray"
 
-# Lazy load models on demand
 models = {}
 models_loaded = {}
 
 def get_model(pollutant):
-    """Lazy load model when needed"""
     if pollutant not in models_loaded:
         try:
             path = os.path.join(os.path.dirname(__file__), f"best_cnn_{pollutant}.keras")
@@ -415,11 +360,9 @@ def get_model(pollutant):
 
 @lru_cache(maxsize=200)
 def get_city_coordinates(city_name):
-    # Instant lookup from hardcoded MP coords — no API needed
     for key, coords in MP_CITY_COORDS.items():
         if key.lower() == city_name.lower():
             return coords
-    # Fallback to OpenWeatherMap only for unknown cities
     try:
         url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name},Madhya Pradesh,IN&limit=1&appid={api_key}"
         res = requests.get(url, timeout=8)
@@ -434,76 +377,52 @@ def get_city_coordinates(city_name):
     return None, None
 
 def fetch_envalert_current_aqi(station_id):
-    """Fetch current AQI data for a specific station — with retry and Indian headers"""
     return fetch_envalert_station_with_retry(station_id)
 
 def get_today_data_from_envalert(city_name):
-    """
-    Fetch today's air quality data from EnvAlert API for the given city.
-    Returns average values and AQIs if stations found, or None if no data available.
-    """
     try:
-        # Normalize city name for matching (case-insensitive)
         city_key = None
         for key in CITY_STATIONS.keys():
             if key.lower() == city_name.lower():
                 city_key = key
                 break
-        
         if not city_key:
             print(f"City '{city_name}' not found in CITY_STATIONS mapping", flush=True)
             return None
-        
         station_ids = CITY_STATIONS[city_key]
         print(f"Found {len(station_ids)} stations for {city_key}: {station_ids}", flush=True)
-        
-        # Fetch data for each station in parallel
         all_pollutant_values = {p: [] for p in TARGET_POLLUTANTS}
         all_pollutant_aqis = {p: [] for p in TARGET_POLLUTANTS}
-        
-        # Get station data from ALL-stations cache (avoids individual blocks)
         all_cached = fetch_envalert_all_with_cache()
         station_data_list = []
         if all_cached:
             cached_map = {str(st.get("station_id")): st for st in all_cached}
             station_data_list = [cached_map.get(str(sid)) for sid in station_ids]
-        # Fallback: individual fetch if cache empty
         if not any(station_data_list):
             with ThreadPoolExecutor(max_workers=min(len(station_ids), 5)) as executor:
                 station_data_list = list(executor.map(fetch_envalert_current_aqi, station_ids))
-        
         for station_data in station_data_list:
             if not station_data:
                 continue
-            
             print(f"Station data: {station_data.get('station_name', 'Unknown')}", flush=True)
-            
-            # Extract pollutant values and their AQIs
             for pollutant in TARGET_POLLUTANTS:
                 value_key, aqi_key = ENVALERT_POLLUTANT_MAP.get(pollutant)
-                
-                # Get concentration value
                 value = station_data.get(value_key)
                 if value is not None and value != '' and value != 'null':
                     try:
                         all_pollutant_values[pollutant].append(float(value))
                     except (ValueError, TypeError):
                         pass
-                
-                # Get AQI sub-index
                 aqi_value = station_data.get(aqi_key)
                 if aqi_value is not None and aqi_value != '' and aqi_value != 'null':
                     try:
                         all_pollutant_aqis[pollutant].append(float(aqi_value))
                     except (ValueError, TypeError):
                         pass
-        
-        # Calculate averages
         result = {}
         for pollutant in TARGET_POLLUTANTS:
             values = all_pollutant_values[pollutant]
             aqis = all_pollutant_aqis[pollutant]
-            
             if values and aqis:
                 avg_value = sum(values) / len(values)
                 avg_aqi = sum(aqis) / len(aqis)
@@ -512,19 +431,16 @@ def get_today_data_from_envalert(city_name):
                     'aqi': round(avg_aqi)
                 }
                 print(f"EnvAlert average {pollutant}: value={avg_value:.2f}, aqi={avg_aqi:.0f} (from {len(values)} stations)", flush=True)
-        
-        # If we got at least some data, return it
         if result:
             return result
         else:
             print(f"No valid pollutant data found for {city_name}", flush=True)
             return None
-            
     except Exception as e:
         print(f"Error in get_today_data_from_envalert: {e}", flush=True)
         return None
 
-_OPENMETEO_TTL = 3600  # 1 hour
+_OPENMETEO_TTL = 3600
 _OPENMETEO_CACHE_DIR = "/tmp/openmeteo_cache"
 os.makedirs(_OPENMETEO_CACHE_DIR, exist_ok=True)
 
@@ -532,7 +448,6 @@ def _om_cache_path(cache_key):
     return os.path.join(_OPENMETEO_CACHE_DIR, f"{cache_key}.json")
 
 def _om_cache_read(cache_key):
-    """Read from disk cache. Returns data if fresh, else None."""
     path = _om_cache_path(cache_key)
     try:
         with open(path, "r") as f:
@@ -545,7 +460,6 @@ def _om_cache_read(cache_key):
     return None
 
 def _om_cache_write(cache_key, data):
-    """Write to disk cache."""
     path = _om_cache_path(cache_key)
     try:
         with open(path, "w") as f:
@@ -554,7 +468,6 @@ def _om_cache_write(cache_key, data):
         print(f"[OpenMeteo] Disk cache write failed: {e}", flush=True)
 
 def fetch_all_pollutant_series(lat, lon):
-    """Fetch ALL 6 pollutants in ONE API call. Disk-cached for 1 hour (survives restarts)."""
     cache_key = f"{round(lat,3)}_{round(lon,3)}"
     cached = _om_cache_read(cache_key)
     if cached is not None:
@@ -573,7 +486,6 @@ def fetch_all_pollutant_series(lat, lon):
             if data.get("error"):
                 reason = data.get('reason', 'unknown')
                 print(f"[OpenMeteo] API error: {reason}", flush=True)
-                # Daily limit hit — no point retrying, break immediately
                 if "limit" in reason.lower():
                     break
                 return None
@@ -591,14 +503,11 @@ def fetch_all_pollutant_series(lat, lon):
 def fetch_pollutant_series(lat, lon, pollutant):
     try:
         api_field = POLLUTANT_API_MAP[pollutant]
-
         hourly = fetch_all_pollutant_series(lat, lon)
         if not hourly:
             return [], []
         values = hourly.get(api_field, [])
         timestamps = hourly.get("time", [])
-
-        # Align last 72 hours ending at current hour
         current_hour = datetime.now(IST).replace(minute=0, second=0, microsecond=0)
         current_index = None
         for i, ts in enumerate(timestamps):
@@ -608,11 +517,9 @@ def fetch_pollutant_series(lat, lon, pollutant):
                 break
         if current_index is None:
             current_index = len(timestamps) - 1
-
         start_index = max(0, current_index - 71)
         series = values[start_index:current_index+1]
         ts_series = timestamps[start_index:current_index+1]
-
         return series, ts_series
     except Exception as e:
         print(f"[{pollutant.upper()}] Pollutant fetch error:", e, flush=True)
@@ -641,92 +548,59 @@ def fetch_weather_series(lat, lon):
     return []
 
 def calculate_errors(envalert_today_data, model_predictions_for_error):
-    """
-    Calculate errors: avg of all stations - predicted by model
-    Returns errors for pm2.5 conc, pm2.5 aqi, pm10 conc, pm10 aqi, and overall aqi
-    """
     errors = {}
-    
     try:
-        # PM2.5 errors
         if envalert_today_data and "pm2_5" in envalert_today_data and "pm2_5" in model_predictions_for_error:
             api_pm25_value = envalert_today_data["pm2_5"]["value"]
             api_pm25_aqi = envalert_today_data["pm2_5"]["aqi"]
             model_pm25_value = model_predictions_for_error["pm2_5"]["value"]
             model_pm25_aqi = model_predictions_for_error["pm2_5"]["aqi"]
-            
             errors["pm2_5_concentration"] = round(api_pm25_value - model_pm25_value, 2)
             errors["pm2_5_aqi"] = round(api_pm25_aqi - model_pm25_aqi, 2)
-            
             print(f"PM2.5 - API: {api_pm25_value}, Model: {model_pm25_value}, Error: {errors['pm2_5_concentration']}", flush=True)
             print(f"PM2.5 AQI - API: {api_pm25_aqi}, Model: {model_pm25_aqi}, Error: {errors['pm2_5_aqi']}", flush=True)
-        
-        # PM10 errors
         if envalert_today_data and "pm10" in envalert_today_data and "pm10" in model_predictions_for_error:
             api_pm10_value = envalert_today_data["pm10"]["value"]
             api_pm10_aqi = envalert_today_data["pm10"]["aqi"]
             model_pm10_value = model_predictions_for_error["pm10"]["value"]
             model_pm10_aqi = model_predictions_for_error["pm10"]["aqi"]
-            
             errors["pm10_concentration"] = round(api_pm10_value - model_pm10_value, 2)
             errors["pm10_aqi"] = round(api_pm10_aqi - model_pm10_aqi, 2)
-            
             print(f"PM10 - API: {api_pm10_value}, Model: {model_pm10_value}, Error: {errors['pm10_concentration']}", flush=True)
             print(f"PM10 AQI - API: {api_pm10_aqi}, Model: {model_pm10_aqi}, Error: {errors['pm10_aqi']}", flush=True)
-        
-        # Overall AQI error - calculate from all available pollutants
         if envalert_today_data and model_predictions_for_error:
-            # Get all AQI values from EnvAlert (excluding o3)
             envalert_aqis = []
             for pollutant in TARGET_POLLUTANTS:
                 if pollutant != "o3" and pollutant in envalert_today_data:
                     envalert_aqis.append(envalert_today_data[pollutant]["aqi"])
-            
-            # Get all AQI values from model predictions (excluding o3)
             model_aqis = []
             for pollutant in TARGET_POLLUTANTS:
                 if pollutant != "o3" and pollutant in model_predictions_for_error:
                     model_aqis.append(model_predictions_for_error[pollutant]["aqi"])
-            
             if envalert_aqis and model_aqis:
                 api_overall_aqi = max(envalert_aqis)
                 model_overall_aqi = max(model_aqis)
                 errors["overall_aqi"] = round(api_overall_aqi - model_overall_aqi, 2)
-                
                 print(f"Overall AQI - API: {api_overall_aqi}, Model: {model_overall_aqi}, Error: {errors['overall_aqi']}", flush=True)
-        
         print(f"Calculated errors: {errors}", flush=True)
-        
     except Exception as e:
         print(f"Error calculating errors: {e}", flush=True)
         import traceback
         traceback.print_exc()
-    
     return errors
 
 def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1, envalert_fallback=None):
-    """
-    Predict pollutant values starting from a given day.
-    start_day=0 for today, start_day=1 for tomorrow onwards.
-    envalert_fallback: dict {pollutant: {value, aqi}} — used when OpenMeteo data is unavailable.
-    """
     try:
-        model = get_model(pollutant)  # Use lazy loading
+        model = get_model(pollutant)
         if not model or len(data) < 72:
-            # ── EnvAlert persistence fallback ─────────────────────────────────
             if envalert_fallback and pollutant in envalert_fallback:
                 live_val = float(envalert_fallback[pollutant]["value"])
                 live_aqi = int(envalert_fallback[pollutant]["aqi"])
                 results = []
                 today_date = datetime.now(IST).date()
-                # Apply a realistic day-by-day variation (±5–15%) so forecast
-                # doesn't show the same flat value for every day.
                 import random, hashlib
-                # Seed from city+pollutant+date so values are stable per day
-                # but differ across days and pollutants.
                 seed_str = f"{pollutant}{today_date.isoformat()}"
                 rng = random.Random(int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2**32))
-                # Daily variation factors: today ~1.0, future days drift ±10%
                 factors = [1.0]
                 for _ in range(1, 7):
                     prev = factors[-1]
@@ -755,50 +629,30 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1, en
             print(f"[predict_pollutant] {pollutant}: no data (len={len(data)}) and no EnvAlert fallback", flush=True)
             return []
 
-        # Latest weather features
         weather_features = weather_data[-1][:9] if weather_data else [0] * 9
-
-        # Prepare initial sequence for model
         seq = [0.0] + data[-72:] + weather_features
         sequence = np.array(seq).reshape((1, 82, 1))
-
         results = []
-
-        # Determine previous day date
         today_date = datetime.now(IST).date()
         prev_date = today_date - timedelta(days=1)
-
-        # Get indices of previous day
         prev_day_indices = [i for i, ts in enumerate(timestamps) if datetime.fromisoformat(ts).date() == prev_date]
-
         if not prev_day_indices:
             print(f"No previous day data found for {prev_date}")
             return []
-
         for i in range(start_day, 7):
             pred_val = float(abs(model.predict(sequence, verbose=0)[0, 0]))
-
-            # Find current hour of previous day
             hour_now = datetime.now(IST).hour
             prev_hour_index = next((idx for idx in prev_day_indices if datetime.fromisoformat(timestamps[idx]).hour == hour_now), None)
-
             if prev_hour_index is None:
                 prev_hour_index = prev_day_indices[-1]
-
-            # Take previous 23 hours from previous day
             start_index = max(prev_hour_index - 23, 0)
             last_23_hours = [data[j] for j in range(start_index, prev_hour_index)]
-
-            # Combine with predicted value
             values_avg = last_23_hours + [pred_val]
             C_avg = sum(values_avg) / len(values_avg)
-
             aqi = get_aqi_sub_index(C_avg, pollutant)
             category, warning, color = get_category_info(aqi)
-
             date = (datetime.utcnow() + timedelta(days=i)).strftime("%Y-%m-%d")
             day = "Today" if i == 0 else "Tomorrow" if i == 1 else (datetime.utcnow() + timedelta(days=i)).strftime("%d %b")
-
             results.append({
                 "day": day,
                 "date": date,
@@ -808,13 +662,9 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1, en
                 "warning": warning,
                 "color": color
             })
-
-            # Update sequence for next prediction
             sequence[0, -1, 0] = pred_val
             sequence = np.roll(sequence, -1, axis=1)
-
         return results
-
     except Exception as e:
         print(f"Prediction error for {pollutant}: {e}", flush=True)
         return []
@@ -825,30 +675,23 @@ def getAvgOfAllStationsValues():
         stations = fetch_envalert_all_with_cache()
         if not stations:
             return None
-
         if not isinstance(stations, list):
             raise ValueError("Unexpected API response format")
-
         pm25_values = []
         pm10_values = []
-
         for station in stations:
-            # PM2.5
             pm25 = station.get("pm25")
             if pm25 not in (None, "", "ID"):
                 try:
                     pm25_values.append(float(pm25))
                 except ValueError:
                     pass
-
-            # PM10
             pm10 = station.get("pm10")
             if pm10 not in (None, "", "ID"):
                 try:
                     pm10_values.append(float(pm10))
                 except ValueError:
                     pass
-
         return {
             "pm25_avg": round(sum(pm25_values) / len(pm25_values), 2) if pm25_values else None,
             "pm10_avg": round(sum(pm10_values) / len(pm10_values), 2) if pm10_values else None,
@@ -856,22 +699,16 @@ def getAvgOfAllStationsValues():
             "pm10_stations": len(pm10_values),
             "total_stations": len(stations)
         }
-
     except Exception as e:
         print(f"Error fetching all stations current AQI: {e}", flush=True)
         return None
 
 
 def get_avg_aqi_from_stations():
-    """
-    Compute the average AQI across all EnvAlert stations that report a valid AQI value.
-    Returns a rounded integer or None if no valid data is available.
-    """
     try:
         stations = fetch_envalert_all_with_cache()
         if not stations or not isinstance(stations, list):
             return None
-
         aqi_values = []
         for station in stations:
             aqi_raw = station.get("aqi") or station.get("AQI")
@@ -883,14 +720,11 @@ def get_avg_aqi_from_stations():
                     aqi_values.append(aqi_val)
             except (ValueError, TypeError):
                 continue
-
         if not aqi_values:
             return None
-
         avg = round(sum(aqi_values) / len(aqi_values))
         print(f"[get_avg_aqi_from_stations] avg={avg} from {len(aqi_values)} stations", flush=True)
         return avg
-
     except Exception as e:
         print(f"[get_avg_aqi_from_stations] Error: {e}", flush=True)
         return None
@@ -903,7 +737,6 @@ def get_city_station_avg_aqi(city_name):
     Returns a rounded integer or None if no valid data is available.
     """
     try:
-        # Resolve city key (case-insensitive)
         city_key = None
         for key in CITY_STATIONS:
             if key.lower() == city_name.lower():
@@ -912,23 +745,16 @@ def get_city_station_avg_aqi(city_name):
         if not city_key:
             print(f"[get_city_station_avg_aqi] City '{city_name}' not in CITY_STATIONS", flush=True)
             return None
-
         station_ids = set(str(sid) for sid in CITY_STATIONS[city_key])
-
         all_stations = fetch_envalert_all_with_cache()
         if not all_stations or not isinstance(all_stations, list):
             return None
-
         aqi_values = []
         for station in all_stations:
             sid = str(station.get("station_id", "")).strip()
             if sid not in station_ids:
                 continue
-
-            # Try direct AQI field first
             aqi_raw = station.get("aqi") or station.get("AQI")
-
-            # Fallback: compute from pm25 sub-index if no direct AQI
             if aqi_raw in (None, "", "null", "NULL", "ID"):
                 pm25_raw = station.get("pm25")
                 if pm25_raw not in (None, "", "null", "ID"):
@@ -936,10 +762,8 @@ def get_city_station_avg_aqi(city_name):
                         aqi_raw = get_aqi_sub_index(float(str(pm25_raw).strip()), "pm2_5")
                     except Exception:
                         pass
-
             if aqi_raw in (None, "", "null", "NULL", "ID"):
                 continue
-
             try:
                 aqi_val = float(str(aqi_raw).strip())
                 if 0 < aqi_val <= 500:
@@ -947,18 +771,81 @@ def get_city_station_avg_aqi(city_name):
                     print(f"[get_city_station_avg_aqi] {city_key} station {sid}: AQI={aqi_val}", flush=True)
             except (ValueError, TypeError):
                 continue
-
         if not aqi_values:
             print(f"[get_city_station_avg_aqi] No valid AQI data for {city_key}", flush=True)
             return None
-
         avg = round(sum(aqi_values) / len(aqi_values))
         print(f"[get_city_station_avg_aqi] {city_key}: avg={avg} from {len(aqi_values)} active stations", flush=True)
         return avg
-
     except Exception as e:
         print(f"[get_city_station_avg_aqi] Error: {e}", flush=True)
         return None
+
+
+# ── THE KEY FIX: Blended AQI for today ───────────────────────────────────────
+def compute_today_blended_aqi(model_aqi, city_name, envalert_today_data):
+    """
+    Blend the model's predicted AQI for TODAY with the real station average.
+
+    Root cause of the bug:
+      The CNN model is trained on Open-Meteo satellite-derived pollutant estimates,
+      which systematically read LOWER than actual ground sensors (EnvAlert stations).
+      For Jabalpur: stations report 94, 77, 52, 52 → avg=69, but model outputs 35.
+      The existing bias correction (BIAS_FACTOR_TODAY=0.85 with a 90% cap) only
+      partially fixes individual pollutant concentrations, and even after correction
+      the max() of model sub-indices for overall AQI still lands far below reality.
+
+    Fix strategy — keep AQI model-driven but correct the magnitude using a
+    weighted blend of model output and real station average:
+
+        display_aqi = MODEL_WEIGHT * model_aqi + STATION_WEIGHT * station_avg_aqi
+
+    Weights:
+      MODEL_WEIGHT   = 0.35  → Model still contributes (result is not a pure station read)
+      STATION_WEIGHT = 0.65  → Station average pulls value toward ground truth
+
+    For Jabalpur example:
+      display_aqi = 0.35 * 35 + 0.65 * 69 = 12.25 + 44.85 ≈ 57
+      (much closer to 69 than raw model's 35, and still model-influenced)
+
+    Future days (i > 0) are left as pure model output since no station data exists.
+    If station data is unavailable, model_aqi is returned unchanged.
+    """
+    MODEL_WEIGHT   = 0.35
+    STATION_WEIGHT = 0.65
+
+    try:
+        # Primary: read the AQI field directly from each station (most accurate)
+        station_avg = get_city_station_avg_aqi(city_name)
+
+        # Fallback: derive station avg from per-pollutant sub-indices in envalert_today_data
+        if station_avg is None and envalert_today_data:
+            sub_indices = [
+                envalert_today_data[p]["aqi"]
+                for p in TARGET_POLLUTANTS
+                if p != "o3" and p in envalert_today_data
+            ]
+            if sub_indices:
+                station_avg = round(sum(sub_indices) / len(sub_indices))
+
+        if station_avg is None:
+            print(f"[blended_aqi] No station data for {city_name} — using raw model AQI={model_aqi}", flush=True)
+            return model_aqi
+
+        blended = round(MODEL_WEIGHT * model_aqi + STATION_WEIGHT * station_avg)
+        blended = max(0, min(500, blended))  # clamp to valid AQI range
+
+        print(
+            f"[blended_aqi] {city_name}: model={model_aqi}, station_avg={station_avg}, "
+            f"blended={blended} (35% model + 65% station)",
+            flush=True
+        )
+        return blended
+
+    except Exception as e:
+        print(f"[blended_aqi] Error for {city_name}: {e} — returning model AQI", flush=True)
+        return model_aqi
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @app.route('/predict', methods=['POST', 'OPTIONS'])
@@ -983,7 +870,7 @@ def predict():
         weather_data = fetch_weather_series(lat, lon)
         if not weather_data:
             print(f"[predict] Weather fetch failed for {city_name}, using empty fallback", flush=True)
-            weather_data = []  # Continue without weather — model will use defaults
+            weather_data = []
 
         # ✅ EnvAlert (PRIMARY → city stations)
         envalert_today_data = get_today_data_from_envalert(city_name)
@@ -1008,7 +895,6 @@ def predict():
         # 🔮 MODEL predictions (TODAY INCLUDED)
         for pollutant in TARGET_POLLUTANTS:
             pol_data, ts_series = pollutant_results.get(pollutant, ([], []))
-
             prediction = predict_pollutant(
                 pollutant,
                 pol_data,
@@ -1017,10 +903,7 @@ def predict():
                 start_day=0,
                 envalert_fallback=envalert_today_data
             )
-
             result[pollutant] = prediction
-
-            # Store TODAY model prediction for error calc
             if prediction:
                 model_predictions_for_error[pollutant] = prediction[0]
 
@@ -1028,8 +911,6 @@ def predict():
         errors = calculate_errors(envalert_today_data, model_predictions_for_error)
 
         # ➕ Apply error correction (PM2.5 & PM10) → TODAY + FUTURE
-        # Today (i=0): capped at 90% of station value so prediction stays below station
-        # Future days (i>0): only apply reduced bias (30%) to avoid flat same-value forecast
         BIAS_FACTOR_TODAY  = 0.85
         BIAS_FACTOR_FUTURE = 0.70
         station_pm25 = envalert_today_data.get("pm2_5", {}).get("value") if envalert_today_data else None
@@ -1042,16 +923,13 @@ def predict():
                 for i in range(len(result[pollutant])):
                     bias = BIAS_FACTOR_TODAY if i == 0 else BIAS_FACTOR_FUTURE
                     corrected = result[pollutant][i]["value"] + (errors[error_key] * bias)
-                    # Cap only today at 90% of station value
                     if i == 0:
                         cap = station_caps.get(pollutant)
                         if cap and corrected > cap * 0.90:
                             corrected = cap * 0.90
                     result[pollutant][i]["value"] = round(corrected, 2)
-
                     new_aqi = get_aqi_sub_index(result[pollutant][i]["value"], pollutant)
                     result[pollutant][i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
-
                     category, warning, color = get_category_info(result[pollutant][i]["aqi"])
                     result[pollutant][i]["category"] = category
                     result[pollutant][i]["warning"] = warning
@@ -1060,18 +938,14 @@ def predict():
         # ➕ PM10 = PM10 + PM2.5 (MODEL BASED)
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
-
         if pm10_preds and pm25_preds:
             for i in range(min(len(pm10_preds), len(pm25_preds))):
                 combined_value = pm10_preds[i]["value"] + pm25_preds[i]["value"]
-                # Cap only today's PM10 at 90% of station value
                 if i == 0 and station_pm10_val and combined_value > station_pm10_val * 0.90:
                     combined_value = station_pm10_val * 0.90
                 pm10_preds[i]["value"] = round(combined_value, 2)
-
                 new_aqi = get_aqi_sub_index(combined_value, "pm10")
                 pm10_preds[i]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
-
                 category, warning, color = get_category_info(pm10_preds[i]["aqi"])
                 pm10_preds[i]["category"] = category
                 pm10_preds[i]["warning"] = warning
@@ -1086,7 +960,6 @@ def predict():
 
         # 🌍 Overall AQI (excluding O3)
         overall_daily_aqi = []
-        # Find any pollutant that has predictions to use for day/date labels
         label_pollutant = next(
             (p for p in TARGET_POLLUTANTS if result.get(p)), None
         )
@@ -1109,18 +982,36 @@ def predict():
 
                 if daily_values:
                     highest = max(daily_values, key=lambda x: x["aqi"])
+                    model_aqi = highest["aqi"]
+
+                    if i == 0:
+                        # ── TODAY: blend model output with real station average ──────────
+                        # The model under-predicts because Open-Meteo satellite data reads
+                        # lower than ground sensors. We keep it model-driven (35% weight)
+                        # but pull toward reality (65% station avg).
+                        # Example: Jabalpur stations 94,77,52,52 → avg=69, model=35
+                        #   blended = 0.35*35 + 0.65*69 ≈ 57  (vs raw model's 35)
+                        display_aqi = compute_today_blended_aqi(
+                            model_aqi, city_name, envalert_today_data
+                        )
+                    else:
+                        # Future days: pure model — no ground truth available
+                        display_aqi = model_aqi
+
+                    display_category, display_warning, display_color = get_category_info(display_aqi)
+
                     overall_daily_aqi.append({
                         "day": result[label_pollutant][i]["day"],
                         "date": result[label_pollutant][i]["date"],
                         "main_pollutant": highest["pollutant"],
                         "value": highest["value"],
-                        "aqi": highest["aqi"],
-                        "category": highest["category"],
-                        "warning": highest["warning"],
-                        "color": highest["color"]
+                        "aqi": display_aqi,
+                        "category": display_category,
+                        "warning": display_warning,
+                        "color": display_color
                     })
 
-        # 💾 Store today's model prediction for historical stats
+        # 💾 Store today's blended prediction for historical stats
         try:
             today_date_str = datetime.now(IST).date().isoformat()
             today_overall = next((e for e in overall_daily_aqi if e.get("day") == "Today"), None)
@@ -1135,7 +1026,7 @@ def predict():
             "today_pollutants": today_pollutants,
             "overall_daily_aqi": overall_daily_aqi,
             "errors": errors,
-            "env_source": env_source,   # 🔥 city / nearest_city_fallback
+            "env_source": env_source,
             "lat": lat,
             "lon": lon,
             "data_available": bool(overall_daily_aqi)
@@ -1150,38 +1041,30 @@ def predict():
 def weather_forecast():
     if request.method == 'OPTIONS':
         return jsonify({"status": "OK"}), 200
-
     try:
         if not request.json:
             return jsonify({"error": "No JSON data provided"}), 400
-        
         city_name = request.json.get("city")
         if not city_name:
             return jsonify({"error": "City name required"}), 400
-
         lat, lon = get_city_coordinates(city_name)
         if lat is None or lon is None:
             return jsonify({"error": "City not found"}), 404
-
         today = datetime.now(IST).date()
         start_date = today.strftime("%Y-%m-%d")
         end_date = (today + timedelta(days=3)).strftime("%Y-%m-%d")
-
-        # Call 1: daily forecast (no current — avoids Open-Meteo conflict)
         daily_url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
             f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max"
             f"&timezone=Asia/Kolkata&start_date={start_date}&end_date={end_date}"
         )
-        # Call 2: current weather only (no date range)
         current_url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={lat}&longitude={lon}"
             f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m,apparent_temperature,precipitation,weathercode"
             f"&timezone=Asia/Kolkata"
         )
-
         daily_data = None
         current_data = None
         for _attempt in range(3):
@@ -1196,24 +1079,18 @@ def weather_forecast():
             except Exception as _e:
                 print(f"[weather] attempt {_attempt+1} failed: {_e}", flush=True)
                 time.sleep(1)
-
         if not daily_data or daily_data.get("error"):
             reason = daily_data.get("reason", "unknown") if daily_data else "no response"
             print(f"[weather] daily forecast unavailable: {reason} — using seasonal estimate fallback", flush=True)
-
-            # ── Seasonal estimate fallback for MP cities (April baseline) ──────
-            # April averages for Madhya Pradesh: hot & dry pre-monsoon season
             import random, hashlib
             today = datetime.now(IST).date()
             month = today.month
-            # Monthly temperature baselines (°C max / min) for MP
             month_temps = {
                 1: (26, 11), 2: (29, 13), 3: (34, 18), 4: (39, 23),
                 5: (42, 26), 6: (38, 25), 7: (32, 24), 8: (31, 23),
                 9: (32, 23), 10: (33, 20), 11: (29, 14), 12: (26, 11)
             }
             base_max, base_min = month_temps.get(month, (35, 20))
-
             fallback_forecast = []
             for i in range(4):
                 day_date = today + timedelta(days=i)
@@ -1232,7 +1109,6 @@ def weather_forecast():
                     "precipitation_mm": precip,
                     "max_wind_speed_kmh": wind
                 })
-
             return jsonify({
                 "city": city_name,
                 "forecast": fallback_forecast,
@@ -1246,10 +1122,8 @@ def weather_forecast():
                 },
                 "source": "seasonal_estimate"
             })
-
         daily = daily_data.get("daily", {})
         current = current_data.get("current", {}) if current_data else {}
-
         forecast = []
         for i in range(len(daily.get("time", []))):
             date_str = daily["time"][i]
@@ -1263,7 +1137,6 @@ def weather_forecast():
                 "precipitation_mm": daily["precipitation_sum"][i],
                 "max_wind_speed_kmh": daily["windspeed_10m_max"][i]
             })
-
         return jsonify({
             "city": city_name,
             "forecast": forecast,
@@ -1276,7 +1149,6 @@ def weather_forecast():
                 "weathercode": current.get("weathercode"),
             }
         })
-
     except Exception as e:
         print(f"Error in /weather: {e}", flush=True)
         return jsonify({"error": "Internal server error"}), 500
@@ -1284,13 +1156,11 @@ def weather_forecast():
 @app.route('/api/station/<int:station_id>', methods=['GET'])
 def proxy_station_aqi(station_id):
     try:
-        # First try to get from ALL stations cache — faster and avoids individual blocks
         all_stations = fetch_envalert_all_with_cache()
         if all_stations:
             for st in all_stations:
                 if str(st.get("station_id")) == str(station_id):
                     return jsonify([st])
-        # Fallback to individual fetch
         data = fetch_envalert_station_with_retry(station_id)
         if data is None:
             return jsonify([]), 200
@@ -1302,43 +1172,27 @@ def proxy_station_aqi(station_id):
 @app.route('/api/get_average', methods=['GET'])
 def get_average():
     data = getAvgOfAllStationsValues()
-
     if data is None:
         return jsonify({"error": "Failed to fetch average AQI data"}), 500
-
     return jsonify(data)
-
 
 
 @app.route('/predict_grid', methods=['POST', 'OPTIONS'])
 def predict_grid():
-    """
-    Accepts a city name + grid_size, generates a grid of lat/lon points
-    around the city, runs CNN models for each point, returns predicted
-    AQI per point. Used by frontend to build a model-driven IDW heatmap.
-    """
     if request.method == 'OPTIONS':
         return jsonify({"status": "OK"}), 200
-
     try:
         if not request.json:
             return jsonify({"error": "No JSON data provided"}), 400
-
         city_name = request.json.get("city")
-        grid_size = int(request.json.get("grid_size", 3))   # 3x3 = 9 points (fast)
-        radius_deg = float(request.json.get("radius_deg", 0.3))  # ~33km radius
-
+        grid_size = int(request.json.get("grid_size", 3))
+        radius_deg = float(request.json.get("radius_deg", 0.3))
         if not city_name:
             return jsonify({"error": "city is required"}), 400
-
-        # Get city center coordinates
         center_lat, center_lon = get_city_coordinates(city_name)
         if not center_lat or not center_lon:
             return jsonify({"error": f"Could not find coordinates for {city_name}"}), 400
-
         print(f"🗺️ predict_grid: {city_name} ({center_lat},{center_lon}) grid={grid_size}x{grid_size}", flush=True)
-
-        # Generate evenly spaced grid of points around city center
         points = []
         step = (radius_deg * 2) / (grid_size - 1) if grid_size > 1 else 0
         for i in range(grid_size):
@@ -1346,10 +1200,7 @@ def predict_grid():
                 pt_lat = round(center_lat - radius_deg + i * step, 4)
                 pt_lon = round(center_lon - radius_deg + j * step, 4)
                 points.append({"lat": pt_lat, "lon": pt_lon})
-
         print(f"📍 Generated {len(points)} grid points", flush=True)
-
-        # Pre-fetch city center data ONCE — all grid points reuse it (saves 54 API calls)
         center_weather = fetch_weather_series(center_lat, center_lon)
         center_pol_results = {}
         for _pol in TARGET_POLLUTANTS:
@@ -1361,25 +1212,18 @@ def predict_grid():
             pt_lat = point["lat"]
             pt_lon = point["lon"]
             try:
-                # Reuse city center weather & pollutant data for all grid points
                 weather_data = center_weather
-
                 pol_results = center_pol_results
-
-                # Run CNN model for each pollutant, collect today's AQI
                 daily_aqis = []
                 pollutant_details = {}
-
                 for pollutant in TARGET_POLLUTANTS:
                     if pollutant == "o3":
-                        continue  # exclude o3 from overall AQI (matches /predict logic)
-
+                        continue
                     pol_data, ts_series = pol_results.get(pollutant, ([], []))
                     prediction = predict_pollutant(
                         pollutant, pol_data, weather_data, ts_series, start_day=0,
                         envalert_fallback=center_envalert
                     )
-
                     if prediction and len(prediction) > 0:
                         today_aqi = prediction[0]["aqi"]
                         daily_aqis.append(today_aqi)
@@ -1388,34 +1232,25 @@ def predict_grid():
                             "value": prediction[0]["value"],
                             "category": prediction[0]["category"]
                         }
-
                 if not daily_aqis:
                     return {"lat": pt_lat, "lon": pt_lon, "aqi": None, "error": "no_predictions"}
-
-                # Overall AQI = max across pollutants (same as /predict endpoint)
                 overall_aqi = max(daily_aqis)
                 print(f"  ✅ ({pt_lat},{pt_lon}) → AQI={overall_aqi}", flush=True)
-
                 return {
                     "lat": pt_lat,
                     "lon": pt_lon,
                     "aqi": overall_aqi,
                     "pollutants": pollutant_details
                 }
-
             except Exception as e:
                 print(f"  ❌ Error for ({pt_lat},{pt_lon}): {e}", flush=True)
                 return {"lat": pt_lat, "lon": pt_lon, "aqi": None, "error": str(e)}
 
-        # Process all grid points in parallel (max 5 at once to avoid overload)
         with ThreadPoolExecutor(max_workers=5) as executor:
             results = list(executor.map(predict_aqi_for_point, points))
-
         valid_results = [r for r in results if r.get("aqi") is not None]
         failed_count = len(results) - len(valid_results)
-
         print(f"✅ predict_grid done: {len(valid_results)} valid, {failed_count} failed", flush=True)
-
         return jsonify({
             "city": city_name,
             "center": {"lat": center_lat, "lon": center_lon},
@@ -1424,7 +1259,6 @@ def predict_grid():
             "valid_points": len(valid_results),
             "grid": valid_results
         })
-
     except Exception as e:
         print(f"Error in /predict_grid: {e}", flush=True)
         import traceback
@@ -1433,7 +1267,6 @@ def predict_grid():
 
 @app.route('/debug_stations', methods=['GET'])
 def debug_stations():
-    """Debug endpoint — shows raw EnvAlert API response for first 3 stations"""
     try:
         data = fetch_envalert_all_with_cache()
         if isinstance(data, list) and len(data) > 0:
@@ -1449,7 +1282,6 @@ def debug_stations():
 
 @app.route("/all_stations_aqi", methods=["GET", "OPTIONS"])
 def all_stations_aqi():
-    """Returns individual AQI for every station: {station_id: aqi}"""
     if request.method == "OPTIONS":
         return jsonify({"status": "OK"}), 200
     try:
@@ -1478,43 +1310,29 @@ def all_stations_aqi():
 def mp_ranking():
     if request.method == 'OPTIONS':
         return jsonify({"status": "OK"}), 200
-
     try:
         city_name = (request.json or {}).get("city", "").strip()
-
-        # ── 1. Fetch ALL station data ──────────────────────────────
         stations = fetch_envalert_all_with_cache()
         if not stations or not isinstance(stations, list) or len(stations) == 0:
             return jsonify({"error": "No station data available"}), 503
-
         print(f"[mp_ranking] Got {len(stations)} stations. Sample keys: {list(stations[0].keys())}", flush=True)
-
-        # ── 2. Reverse map: station_id (int) → city name ───────────
         station_to_city = {}
         for cname, ids in CITY_STATIONS.items():
             for sid in ids:
                 station_to_city[int(sid)] = cname
-
-        # ── 3. Parse each station → get AQI ────────────────────────
-        city_aqi_map = {}  # city → list of aqi values
-
+        city_aqi_map = {}
         for station in stations:
-            # Get station_id — could be int or string
             sid_raw = station.get("station_id")
             try:
                 sid = int(str(sid_raw).strip())
             except (ValueError, TypeError):
                 continue
-
-            # Get AQI — try multiple field names, API returns string "177"
             aqi_raw = None
             for field in ["aqi", "AQI", "overall_aqi", "pm25_subindex", "pm10_subindex"]:
                 val = station.get(field)
                 if val not in (None, "", "null", "NULL", "ID", "N/A"):
                     aqi_raw = val
                     break
-
-            # If no aqi field, calculate from pm25 using our breakpoints
             if aqi_raw is None:
                 pm25_raw = station.get("pm25") or station.get("PM25") or station.get("pm2_5")
                 if pm25_raw not in (None, "", "null", "ID"):
@@ -1523,38 +1341,27 @@ def mp_ranking():
                         aqi_raw = get_aqi_sub_index(pm25_val, "pm2_5")
                     except:
                         pass
-
             if aqi_raw is None:
                 continue
-
             try:
                 aqi_val = float(str(aqi_raw).strip())
                 if aqi_val <= 0 or aqi_val > 500:
                     continue
             except (ValueError, TypeError):
                 continue
-
-            # Match station to city
             city = station_to_city.get(sid)
-
-            # Fallback: match by station_name string
             if not city:
                 sname = str(station.get("station_name", "") or station.get("name", "")).lower()
                 for cname in CITY_STATIONS:
                     if cname.lower() in sname:
                         city = cname
                         break
-
             if city:
                 city_aqi_map.setdefault(city, []).append(aqi_val)
                 print(f"[mp_ranking] Station {sid} → {city}: AQI={aqi_val}", flush=True)
-
         print(f"[mp_ranking] Cities mapped: {list(city_aqi_map.keys())}", flush=True)
-
         if not city_aqi_map:
             return jsonify({"error": "Could not map any stations to cities. Check station IDs."}), 500
-
-        # ── 4. Average AQI per city, sort highest → lowest ─────────
         city_rankings = []
         for cname, aqis in city_aqi_map.items():
             avg_aqi = round(sum(aqis) / len(aqis))
@@ -1566,17 +1373,13 @@ def mp_ranking():
                 "color": color,
                 "station_count": len(aqis),
             })
-
         city_rankings.sort(key=lambda x: x["aqi"], reverse=False)
         for i, entry in enumerate(city_rankings):
             entry["rank"] = i + 1
-
-        # ── 5. Find rank of requested city ─────────────────────────
         target_entry = next(
             (e for e in city_rankings if e["city"].lower() == city_name.lower()),
             None
         )
-
         return jsonify({
             "city": city_name,
             "rank": target_entry["rank"] if target_entry else None,
@@ -1586,7 +1389,6 @@ def mp_ranking():
             "color": target_entry["color"] if target_entry else None,
             "all_rankings": city_rankings,
         })
-
     except Exception as e:
         print(f"[mp_ranking] Error: {e}", flush=True)
         import traceback
@@ -1601,15 +1403,11 @@ def monthly_average():
     try:
         data = request.get_json()
         city_name = data.get("city", "").strip()
-
         lat, lon = get_city_coordinates(city_name)
         if lat is None or lon is None:
             return jsonify({"error": f"City '{city_name}' not found"}), 404
-
         end_date = datetime.now(IST).date()
         start_date = end_date - timedelta(days=29)
-
-        # Fetch all 6 pollutants in ONE call, disk-cached (survives restarts)
         all_fields = ",".join(POLLUTANT_API_MAP.values())
         ma_cache_key = f"monthly_{round(lat,3)}_{round(lon,3)}_{start_date}_{end_date}"
         ma_hourly = _om_cache_read(ma_cache_key)
@@ -1638,10 +1436,7 @@ def monthly_average():
                     ma_hourly = d["hourly"]
                     _om_cache_write(ma_cache_key, ma_hourly)
                     print(f"[monthly_average] Fetched & cached all pollutants for {city_name}", flush=True)
-
         results = {}
-
-        # ── If OpenMeteo monthly data is unavailable, build estimates from EnvAlert ──
         if ma_hourly is None:
             print(f"[monthly_average] OpenMeteo unavailable — using EnvAlert-based historical estimate for {city_name}", flush=True)
             envalert_live = get_today_data_from_envalert(city_name)
@@ -1657,13 +1452,10 @@ def monthly_average():
                         day_date = (end_date - timedelta(days=days_ago)).strftime("%Y-%m-%d")
                         seed_str = f"{pollutant}{day_date}"
                         rng = random.Random(int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2**32))
-                        # Seasonal/daily noise ±20%
                         noise = rng.uniform(0.80, 1.20)
                         estimated = round(max(0, live_val * noise), 2)
                         daily_list.append({"date": day_date, "avg": estimated})
                     results[pollutant] = daily_list
-
-                # Build AQI series from pm2_5 estimates
                 import math
                 aqi_series = []
                 for entry in results.get("pm2_5", []):
@@ -1673,9 +1465,6 @@ def monthly_average():
                         aqi_series.append({"date": entry["date"], "avg": safe})
                     except Exception:
                         aqi_series.append({"date": entry["date"], "avg": None})
-
-                # Build per-day station AQI series from all pollutant estimates
-                # Today: live from city's active stations; past days: average of sub-indices
                 station_aqi_series_fb = []
                 live_station_avg_fb = get_city_station_avg_aqi(city_name)
                 today_str_fb = end_date.strftime("%Y-%m-%d")
@@ -1684,9 +1473,7 @@ def monthly_average():
                     if date_str == today_str_fb and live_station_avg_fb is not None:
                         station_aqi_series_fb.append({"date": date_str, "avg": live_station_avg_fb})
                     else:
-                        # Use the same value as aqi_series for fallback (no better data available)
                         station_aqi_series_fb.append({"date": date_str, "avg": entry.get("avg")})
-
                 return jsonify({
                     "city": city_name,
                     "start_date": str(start_date),
@@ -1698,7 +1485,6 @@ def monthly_average():
                     "source": "envalert_estimate"
                 })
             else:
-                # Nothing available at all
                 return jsonify({
                     "city": city_name,
                     "start_date": str(start_date),
@@ -1710,7 +1496,6 @@ def monthly_average():
                     "error": "Historical data temporarily unavailable. OpenMeteo API limit reached."
                 }), 503
 
-
         for pollutant, api_field in POLLUTANT_API_MAP.items():
             try:
                 if ma_hourly is None:
@@ -1718,15 +1503,12 @@ def monthly_average():
                     continue
                 hourly_values = ma_hourly.get(api_field, [])
                 hourly_times  = ma_hourly.get("time", [])
-
-                # Group by date and compute daily average
                 daily = {}
                 for ts, val in zip(hourly_times, hourly_values):
                     if val is None:
                         continue
                     date_str = ts[:10]
                     daily.setdefault(date_str, []).append(val)
-
                 results[pollutant] = [
                     {"date": date, "avg": round(sum(vals) / len(vals), 2)}
                     for date, vals in sorted(daily.items())
@@ -1735,18 +1517,15 @@ def monthly_average():
                 print(f"[monthly_average] {pollutant} error: {e}", flush=True)
                 results[pollutant] = []
 
-        # Compute daily overall AQI as max sub-index across all pollutants (excluding o3)
-        # This matches exactly how the dashboard /predict computes overall AQI
         import math
         aqi_series_raw = []
-        # Collect all dates from pm2_5 as reference axis
         ref_dates = [e["date"] for e in results.get("pm2_5", [])]
         for date_str in ref_dates:
             try:
                 day_sub_indices = []
                 for pollutant in TARGET_POLLUTANTS:
                     if pollutant == "o3":
-                        continue  # excluded from overall AQI, same as /predict
+                        continue
                     day_entry = next(
                         (e for e in results.get(pollutant, []) if e["date"] == date_str), None
                     )
@@ -1762,13 +1541,12 @@ def monthly_average():
                 print(f"[monthly_average] AQI calc error for {date_str}: {ex}", flush=True)
                 aqi_series_raw.append({"date": date_str, "avg": None})
 
-        # Apply correction factor: align Open-Meteo AQI to EnvAlert real sensor AQI
         correction = 0
+        envalert_today = None
         try:
             envalert_today = get_today_data_from_envalert(city_name)
             if envalert_today and "pm2_5" in envalert_today:
                 envalert_aqi_today = max([envalert_today[p]["aqi"] for p in TARGET_POLLUTANTS if p != "o3" and p in envalert_today])
-                # Find today's Open-Meteo AQI
                 today_str = datetime.now(IST).date().strftime("%Y-%m-%d")
                 openmeteo_today = next((e["avg"] for e in aqi_series_raw if e["date"] == today_str and e["avg"] is not None), None)
                 if openmeteo_today:
@@ -1777,7 +1555,6 @@ def monthly_average():
         except Exception as ce:
             print(f"[monthly_average] correction calc error: {ce}", flush=True)
 
-        # Apply correction clamped to ±80 to avoid wild shifts
         correction = max(-80, min(80, correction))
         aqi_series = []
         for entry in aqi_series_raw:
@@ -1787,7 +1564,6 @@ def monthly_average():
             else:
                 aqi_series.append(entry)
 
-        # Apply per-pollutant correction to align Open-Meteo values with EnvAlert sensors
         try:
             if envalert_today:
                 today_str = datetime.now(IST).date().strftime("%Y-%m-%d")
@@ -1795,15 +1571,12 @@ def monthly_average():
                     if pollutant not in envalert_today or pollutant not in results:
                         continue
                     live_val = envalert_today[pollutant]["value"]
-                    # Find today's Open-Meteo value for this pollutant
                     today_entry = next((e for e in results[pollutant] if e["date"] == today_str), None)
                     if not today_entry or today_entry["avg"] is None:
                         continue
                     pol_correction = round(live_val - today_entry["avg"], 2)
-                    # Clamp correction to ±100
                     pol_correction = max(-100, min(100, pol_correction))
                     print(f"[monthly_average] {pollutant} correction: live={live_val}, openmeteo={today_entry['avg']}, offset={pol_correction}", flush=True)
-                    # Apply to all days
                     results[pollutant] = [
                         {"date": e["date"], "avg": round(max(0, e["avg"] + pol_correction), 2)}
                         if e["avg"] is not None else e
@@ -1812,8 +1585,6 @@ def monthly_average():
         except Exception as pe:
             print(f"[monthly_average] pollutant correction error: {pe}", flush=True)
 
-        # ── Live AQI from EnvAlert (same method as dashboard /predict) ────────────
-        # Dashboard AQI = max(sub-indices across pm2.5, pm10, no2, so2, co) from EnvAlert stations
         live_aqi = None
         station_avg_aqi = None
         try:
@@ -1830,16 +1601,12 @@ def monthly_average():
         except Exception as le:
             print(f"[monthly_average] live_aqi error: {le}", flush=True)
 
-        # ── Build station_aqi_series ─────────────────────────────────────────────
-        # Today → live_aqi (real EnvAlert reading, same as dashboard)
-        # Past days → AVERAGE of sub-indices across pollutants (different from aqi_series which uses MAX)
         today_str = datetime.now(IST).date().strftime("%Y-%m-%d")
         station_aqi_series = []
         for entry in aqi_series:
             if entry["date"] == today_str and live_aqi is not None:
                 station_aqi_series.append({"date": entry["date"], "avg": live_aqi})
             else:
-                # Compute average of sub-indices for this day (different from aqi_series max)
                 day_sub_indices = []
                 for pollutant in TARGET_POLLUTANTS:
                     if pollutant == "o3":
@@ -1877,60 +1644,42 @@ def monthly_average():
 
 
 # ── LLM Chat Route (Gemini) ───────────────────────────────────────────────
-# Requires: pip install google-generativeai python-dotenv
-
 import google.genai as genai
 from google.genai import types as genai_types
-import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure Gemini API Key
 _genai_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 @app.route('/api/chat', methods=['POST', 'OPTIONS'])
 def chat():
     if request.method == 'OPTIONS':
         return jsonify({"status": "OK"}), 200
-
     try:
         data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
-
         user_message = data.get("message", "").strip()
         current_city = data.get("city", "")
-
         if not user_message:
             return jsonify({"error": "message is required"}), 400
-
-        # ── Detect if user is asking about a specific MP city ──
         asked_city = None
         for city_key in CITY_STATIONS.keys():
             if city_key.lower() in user_message.lower():
                 asked_city = city_key
                 break
-
-        # Use asked city if found, otherwise fall back to selected city
         target_city = asked_city or current_city
-
-        # Fetch live EnvAlert data for that city
         live_aqi = None
         if target_city:
             live_aqi = get_today_data_from_envalert(target_city)
-
-        # Build context string
         context = ""
         if target_city and live_aqi:
-            # Overall AQI = max of all pollutant AQIs excluding o3
-            # (same logic as your dashboard)
             overall_aqi = max(
                 [live_aqi[p]["aqi"] for p in live_aqi if p != "o3"],
                 default=0
             )
             category, _, _ = get_category_info(overall_aqi)
-
             pollutant_names = {
                 "pm2_5": "PM2.5", "pm10": "PM10",
                 "no2": "NO2", "so2": "SO2",
@@ -1940,7 +1689,6 @@ def chat():
             for p, vals in live_aqi.items():
                 name = pollutant_names.get(p, p)
                 pollutant_lines += f"  {name}: value={round(vals['value'], 2)}, AQI={vals['aqi']}\n"
-
             context = (
                 f"City: {target_city}\n"
                 f"Overall AQI right now: {overall_aqi} ({category})\n"
@@ -1951,8 +1699,6 @@ def chat():
             )
         elif target_city:
             context = f"City: {target_city}\n(No live data available, use general knowledge)\n\n"
-
-        # 🔥 System Prompt
         system_prompt = (
             "You are AeroBot, an air quality assistant for Madhya Pradesh, India. "
             "You have knowledge about air quality, AQI levels, pollutants, and health impacts "
@@ -1969,23 +1715,17 @@ def chat():
             "Be concise, friendly, and use simple language. "
             "Respond in the same language the user writes in (Hindi or English)."
         )
-
-        # 🔥 Combine system + context + user prompt
         full_prompt = (
             f"{system_prompt}\n\n"
             f"{context}"
             f"User question: {user_message}"
         )
-
-        # Call Gemini
-        # Call Gemini — try multiple models if quota exceeded
         GEMINI_MODELS = [
-             "gemini-2.5-flash",
-             "gemini-2.5-flash-lite",
-             "gemini-2.0-flash-001",
-             "gemini-2.0-flash-lite",
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash-001",
+            "gemini-2.0-flash-lite",
         ]
-
         reply = None
         for model_name in GEMINI_MODELS:
             try:
@@ -1999,25 +1739,20 @@ def chat():
             except Exception as model_err:
                 print(f"[/api/chat] Model {model_name} failed: {model_err}", flush=True)
                 continue
-
         if not reply:
-                return jsonify({"error": "All Gemini models quota exceeded. Try again tomorrow."}), 429
-
-        # Clean any remaining markdown just in case
+            return jsonify({"error": "All Gemini models quota exceeded. Try again tomorrow."}), 429
         import re
         reply = re.sub(r'\*\*(.*?)\*\*', r'\1', reply)
         reply = re.sub(r'\*(.*?)\*', r'\1', reply)
         reply = re.sub(r'^\*\s+', '', reply, flags=re.MULTILINE)
         reply = re.sub(r'^\-\s+', '', reply, flags=re.MULTILINE)
         reply = re.sub(r'#{1,6}\s', '', reply)
-
         print(f"[/api/chat] asked_city={asked_city}, target={target_city} → reply length={len(reply)}", flush=True)
         return jsonify({"reply": reply})
-
     except Exception as e:
         print(f"[/api/chat] Error: {e}", flush=True)
         return jsonify({"error": "LLM service unavailable"}), 500
-# ─────────────────────────────────────────────────────────────────────────────
+
 
 @app.route('/debug_models', methods=['GET'])
 def debug_models():
@@ -2026,7 +1761,7 @@ def debug_models():
         return jsonify({"models": available})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+
 if __name__ == "__main__":
     print("🚀 Flask server is starting...", flush=True)
     port = int(os.environ.get("PORT", 5000))
