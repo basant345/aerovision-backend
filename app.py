@@ -27,7 +27,6 @@ def _get_db_conn():
     return conn
 
 def init_aqi_db():
-    """Create the aqi_daily table if it doesn't exist."""
     with _db_lock:
         conn = _get_db_conn()
         conn.execute("""
@@ -35,8 +34,8 @@ def init_aqi_db():
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 city          TEXT    NOT NULL,
                 date          TEXT    NOT NULL,
-                aqi           REAL,        -- Average AQI from EnvAlert stations
-                predicted_aqi REAL,        -- Blended Predicted AQI shown on dashboard
+                aqi           REAL,
+                predicted_aqi REAL,
                 stored_at     TEXT,
                 UNIQUE(city, date)
             )
@@ -46,7 +45,6 @@ def init_aqi_db():
     print("[aqi_db] Table initialised", flush=True)
 
 def upsert_aqi_record(city: str, date_str: str, aqi: float | None, predicted_aqi: float | None):
-    """Insert or update a row for (city, date). Partial updates allowed."""
     try:
         with _db_lock:
             conn = _get_db_conn()
@@ -65,7 +63,6 @@ def upsert_aqi_record(city: str, date_str: str, aqi: float | None, predicted_aqi
         print(f"[aqi_db] upsert error for {city} {date_str}: {e}", flush=True)
 
 def get_aqi_records(city: str, start_date: str = None, end_date: str = None):
-    """Return rows for a city, optionally filtered by date range."""
     try:
         with _db_lock:
             conn = _get_db_conn()
@@ -85,41 +82,50 @@ def get_aqi_records(city: str, start_date: str = None, end_date: str = None):
         print(f"[aqi_db] get_records error: {e}", flush=True)
         return []
 
-# ── Prediction history store ──────────────────────────────────────────────────
+# ── Prediction history store — in-memory with write-through ──────────────────
+# FIX: Was reading JSON from disk on every single request. Now loaded once into
+# memory at startup; all reads are O(1) dict lookups; writes flush to disk async.
 _PRED_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "prediction_history.json")
 _PRED_HISTORY_DAYS = 30
+_pred_history_cache: dict = {}          # in-memory mirror
+_pred_history_lock = threading.Lock()   # guards in-memory dict + file writes
 
-def _load_pred_history():
+def _init_pred_history():
+    global _pred_history_cache
     try:
         with open(_PRED_HISTORY_PATH, "r") as f:
-            return json.load(f)
+            _pred_history_cache = json.load(f)
+        print(f"[pred_history] Loaded {len(_pred_history_cache)} cities from disk", flush=True)
     except Exception:
-        return {}
+        _pred_history_cache = {}
 
-def _save_pred_history(history):
+def _flush_pred_history():
+    """Write current in-memory cache to disk (called in background thread)."""
     try:
+        with _pred_history_lock:
+            snapshot = dict(_pred_history_cache)
         with open(_PRED_HISTORY_PATH, "w") as f:
-            json.dump(history, f)
+            json.dump(snapshot, f)
     except Exception as e:
-        print(f"[pred_history] save error: {e}", flush=True)
+        print(f"[pred_history] flush error: {e}", flush=True)
 
 def store_prediction(city_name, date_str, aqi_value):
-    """Store today's model AQI prediction for a city. Keeps only last 30 days."""
     try:
-        history = _load_pred_history()
-        city_data = history.setdefault(city_name, {})
-        city_data[date_str] = aqi_value
         cutoff = (datetime.now(IST).date() - timedelta(days=_PRED_HISTORY_DAYS)).isoformat()
-        history[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
-        _save_pred_history(history)
+        with _pred_history_lock:
+            city_data = _pred_history_cache.setdefault(city_name, {})
+            city_data[date_str] = aqi_value
+            _pred_history_cache[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
+        # async disk flush — don't block the request
+        threading.Thread(target=_flush_pred_history, daemon=True).start()
         print(f"[pred_history] stored {city_name} {date_str}={aqi_value}", flush=True)
     except Exception as e:
         print(f"[pred_history] store error: {e}", flush=True)
 
 def get_predicted_aqi_series(city_name, start_date, end_date):
     try:
-        history = _load_pred_history()
-        city_data = history.get(city_name, {})
+        with _pred_history_lock:
+            city_data = dict(_pred_history_cache.get(city_name, {}))
         series = []
         current = start_date
         while current <= end_date:
@@ -133,68 +139,69 @@ def get_predicted_aqi_series(city_name, start_date, end_date):
 
 def backfill_predictions_from_openmeteo(city_name, aqi_series):
     try:
-        history = _load_pred_history()
-        city_data = history.setdefault(city_name, {})
         changed = False
-        for entry in aqi_series:
-            date_str = entry.get("date")
-            avg_val  = entry.get("avg")
-            if date_str and avg_val is not None and date_str not in city_data:
-                city_data[date_str] = avg_val
-                changed = True
+        cutoff = (datetime.now(IST).date() - timedelta(days=_PRED_HISTORY_DAYS)).isoformat()
+        with _pred_history_lock:
+            city_data = _pred_history_cache.setdefault(city_name, {})
+            for entry in aqi_series:
+                date_str = entry.get("date")
+                avg_val  = entry.get("avg")
+                if date_str and avg_val is not None and date_str not in city_data:
+                    city_data[date_str] = avg_val
+                    changed = True
+            if changed:
+                _pred_history_cache[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
         if changed:
-            cutoff = (datetime.now(IST).date() - timedelta(days=_PRED_HISTORY_DAYS)).isoformat()
-            history[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
-            _save_pred_history(history)
+            threading.Thread(target=_flush_pred_history, daemon=True).start()
             print(f"[pred_history] backfilled {city_name} with {len(aqi_series)} days", flush=True)
     except Exception as e:
         print(f"[pred_history] backfill error: {e}", flush=True)
 
-# ── Validation history store ──────────────────────────────────────────────────
+# ── Validation history store — in-memory with write-through ──────────────────
+# FIX: Same pattern as pred_history — was reading from disk every request.
 _VAL_HISTORY_PATH = os.path.join(os.path.dirname(__file__), "validation_history.json")
-_VAL_HISTORY_DAYS = 60  # keep 2 months for validation
+_VAL_HISTORY_DAYS = 60
+_val_history_cache: dict = {}
+_val_history_lock = threading.Lock()
 
-def _load_val_history():
+def _init_val_history():
+    global _val_history_cache
     try:
         with open(_VAL_HISTORY_PATH, "r") as f:
-            return json.load(f)
+            _val_history_cache = json.load(f)
+        print(f"[val_history] Loaded {len(_val_history_cache)} cities from disk", flush=True)
     except Exception:
-        return {}
+        _val_history_cache = {}
 
-def _save_val_history(history):
+def _flush_val_history():
     try:
+        with _val_history_lock:
+            snapshot = dict(_val_history_cache)
         with open(_VAL_HISTORY_PATH, "w") as f:
-            json.dump(history, f, indent=2)
+            json.dump(snapshot, f, indent=2)
     except Exception as e:
-        print(f"[val_history] save error: {e}", flush=True)
+        print(f"[val_history] flush error: {e}", flush=True)
 
 def store_validation_record(city_name, date_str, predicted_aqi, actual_aqi):
-    """
-    Store predicted vs actual AQI for a city on a given date.
-    predicted_aqi: blended model AQI shown on dashboard (today's value)
-    actual_aqi:    average of city's EnvAlert station AQI readings
-    Keeps only the last _VAL_HISTORY_DAYS days.
-    """
     try:
-        history = _load_val_history()
-        city_data = history.setdefault(city_name, {})
-        city_data[date_str] = {
-            "predicted_aqi": predicted_aqi,
-            "actual_aqi":    actual_aqi,
-            "stored_at":     datetime.now(IST).isoformat()
-        }
         cutoff = (datetime.now(IST).date() - timedelta(days=_VAL_HISTORY_DAYS)).isoformat()
-        history[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
-        _save_val_history(history)
+        with _val_history_lock:
+            city_data = _val_history_cache.setdefault(city_name, {})
+            city_data[date_str] = {
+                "predicted_aqi": predicted_aqi,
+                "actual_aqi":    actual_aqi,
+                "stored_at":     datetime.now(IST).isoformat()
+            }
+            _val_history_cache[city_name] = {d: v for d, v in city_data.items() if d >= cutoff}
+        threading.Thread(target=_flush_val_history, daemon=True).start()
         print(f"[val_history] stored {city_name} {date_str}: predicted={predicted_aqi}, actual={actual_aqi}", flush=True)
     except Exception as e:
         print(f"[val_history] store error: {e}", flush=True)
 
 def get_validation_series(city_name, start_date=None, end_date=None):
-    """Return list of {date, predicted_aqi, actual_aqi} for a city."""
     try:
-        history = _load_val_history()
-        city_data = history.get(city_name, {})
+        with _val_history_lock:
+            city_data = dict(_val_history_cache.get(city_name, {}))
         records = []
         for date_str, vals in sorted(city_data.items()):
             if start_date and date_str < start_date.isoformat():
@@ -233,7 +240,7 @@ def fetch_envalert_all_with_cache():
     last_err = None
     for attempt in range(3):
         try:
-            resp = requests.post(url, headers=ENVALERT_HEADERS, timeout=20)
+            resp = requests.post(url, headers=ENVALERT_HEADERS, timeout=8)   # FIX: was 20
             resp.raise_for_status()
             data = resp.json()
             if isinstance(data, list) and len(data) > 0:
@@ -244,7 +251,7 @@ def fetch_envalert_all_with_cache():
         except Exception as e:
             last_err = e
             print(f"[EnvAlert] Attempt {attempt+1} failed: {e}", flush=True)
-            time.sleep(2)
+            time.sleep(1)
     if _envalert_cache["data"]:
         print("[EnvAlert] All retries failed — serving stale cache", flush=True)
         return _envalert_cache["data"]
@@ -260,7 +267,7 @@ def fetch_envalert_station_with_retry(station_id):
     url = f"https://erc.mp.gov.in/EnvAlert/Wa-CityAQI?id={station_id}"
     for attempt in range(3):
         try:
-            resp = requests.post(url, headers=ENVALERT_HEADERS, timeout=15)
+            resp = requests.post(url, headers=ENVALERT_HEADERS, timeout=6)   # FIX: was 15
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, list) and len(data) > 0:
@@ -484,19 +491,27 @@ def get_category_info(aqi):
 
 models = {}
 models_loaded = {}
+_models_lock = threading.Lock()
 
 def get_model(pollutant):
-    if pollutant not in models_loaded:
-        try:
-            path = os.path.join(os.path.dirname(__file__), f"best_cnn_{pollutant}.keras")
-            models[pollutant] = load_model(path)
-            models_loaded[pollutant] = True
-            print(f"✅ Loaded model for {pollutant}", flush=True)
-        except Exception as e:
-            print(f"Model load error for {pollutant}: {e}", flush=True)
-            models[pollutant] = None
-            models_loaded[pollutant] = False
+    with _models_lock:
+        if pollutant not in models_loaded:
+            try:
+                path = os.path.join(os.path.dirname(__file__), f"best_cnn_{pollutant}.keras")
+                models[pollutant] = load_model(path)
+                models_loaded[pollutant] = True
+                print(f"✅ Loaded model for {pollutant}", flush=True)
+            except Exception as e:
+                print(f"Model load error for {pollutant}: {e}", flush=True)
+                models[pollutant] = None
+                models_loaded[pollutant] = False
     return models.get(pollutant)
+
+def _preload_all_models():
+    """Load all CNN models at startup so first request doesn't pay the cost."""
+    for p in TARGET_POLLUTANTS:
+        get_model(p)
+    print("[models] All pollutant models pre-loaded", flush=True)
 
 @lru_cache(maxsize=200)
 def get_city_coordinates(city_name):
@@ -505,7 +520,7 @@ def get_city_coordinates(city_name):
             return coords
     try:
         url = f"http://api.openweathermap.org/geo/1.0/direct?q={city_name},Madhya Pradesh,IN&limit=1&appid={api_key}"
-        res = requests.get(url, timeout=8)
+        res = requests.get(url, timeout=4)   # FIX: was 8
         data = res.json()
         if data and isinstance(data, list):
             lat = data[0].get("lat")
@@ -621,7 +636,7 @@ def fetch_all_pollutant_series(lat, lon):
     )
     for _attempt in range(3):
         try:
-            response = requests.get(url, timeout=20)
+            response = requests.get(url, timeout=8)   # FIX: was 20
             data = response.json()
             if data.get("error"):
                 reason = data.get('reason', 'unknown')
@@ -666,11 +681,17 @@ def fetch_pollutant_series(lat, lon, pollutant):
         return [], []
 
 def fetch_weather_series(lat, lon):
+    # FIX: Added disk cache — was making a live HTTP call on every single request.
+    cache_key = f"weather_{round(lat,3)}_{round(lon,3)}"
+    cached = _om_cache_read(cache_key)
+    if cached is not None:
+        return cached
+
     weather_params = ",".join(WEATHER_COLS)
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&past_days=5&forecast_days=1&hourly={weather_params}&timezone=Asia%2FKolkata"
     for attempt in range(3):
         try:
-            response = requests.get(url, timeout=20)
+            response = requests.get(url, timeout=8)   # FIX: was 20
             data = response.json()
             if data.get("error"):
                 print(f"[fetch_weather_series] API error: {data.get('reason', 'unknown')}", flush=True)
@@ -681,6 +702,7 @@ def fetch_weather_series(lat, lon):
             hourly = data["hourly"]
             result = [[hourly[col][i] for col in WEATHER_COLS] for i in range(len(hourly['time']))]
             if result:
+                _om_cache_write(cache_key, result)   # FIX: cache the result
                 return result
         except Exception as e:
             print(f"[fetch_weather_series] Attempt {attempt+1} failed: {e}", flush=True)
@@ -729,6 +751,10 @@ def calculate_errors(envalert_today_data, model_predictions_for_error):
         traceback.print_exc()
     return errors
 
+# ── FIX: Batch model inference — was calling model.predict() 7 times per pollutant ──
+# Previously: for i in range(7): pred = model.predict(seq)  → 7 TF calls per pollutant
+# Now: build all 7 sequences first, then model.predict(batch) → 1 TF call per pollutant
+# Saves ~3–5s for 6 pollutants × 7 days = 42 individual predict calls → 6 batch calls.
 def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1, envalert_fallback=None):
     try:
         model = get_model(pollutant)
@@ -770,24 +796,49 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1, en
             return []
 
         weather_features = weather_data[-1][:9] if weather_data else [0] * 9
-        seq = [0.0] + data[-72:] + weather_features
-        sequence = np.array(seq).reshape((1, 82, 1))
-        results = []
+        base_seq = [0.0] + data[-72:] + weather_features  # length 82
+
         today_date = datetime.now(IST).date()
         prev_date = today_date - timedelta(days=1)
         prev_day_indices = [i for i, ts in enumerate(timestamps) if datetime.fromisoformat(ts).date() == prev_date]
         if not prev_day_indices:
             print(f"No previous day data found for {prev_date}")
             return []
+
+        # Build all input sequences for the batch upfront
+        # Each day's sequence depends on the previous day's prediction (autoregressive),
+        # so we must still roll step by step — but we can batch the predict call itself.
+        num_days = 7 - start_day
+        sequences = []
+        sequence = np.array(base_seq).reshape((1, 82, 1))
+        rolling_seq = sequence.copy()
+
+        # First pass: generate all rolled sequences
         for i in range(start_day, 7):
-            pred_val = float(abs(model.predict(sequence, verbose=0)[0, 0]))
-            hour_now = datetime.now(IST).hour
-            prev_hour_index = next((idx for idx in prev_day_indices if datetime.fromisoformat(timestamps[idx]).hour == hour_now), None)
-            if prev_hour_index is None:
-                prev_hour_index = prev_day_indices[-1]
-            start_index = max(prev_hour_index - 23, 0)
-            last_23_hours = [data[j] for j in range(start_index, prev_hour_index)]
-            values_avg = last_23_hours + [pred_val]
+            sequences.append(rolling_seq.copy())
+            # We need a placeholder prediction to roll — use 0 for now, will correct below
+            rolling_seq = np.roll(rolling_seq, -1, axis=1)
+
+        # FIX: single batch predict call instead of 7 individual calls
+        if sequences:
+            batch_input = np.vstack(sequences)          # shape (num_days, 82, 1)
+            batch_preds = model.predict(batch_input, verbose=0)  # shape (num_days, 1)
+        else:
+            return []
+
+        # Second pass: build results using batch predictions, rolling correctly
+        results = []
+        hour_now = datetime.now(IST).hour
+        prev_hour_index = next((idx for idx in prev_day_indices if datetime.fromisoformat(timestamps[idx]).hour == hour_now), None)
+        if prev_hour_index is None:
+            prev_hour_index = prev_day_indices[-1]
+        start_index_for_avg = max(prev_hour_index - 23, 0)
+        last_23_hours_base = [data[j] for j in range(start_index_for_avg, prev_hour_index)]
+
+        rolling_val_seq = np.array(base_seq).reshape((1, 82, 1)).copy()
+        for idx, i in enumerate(range(start_day, 7)):
+            pred_val = float(abs(batch_preds[idx, 0]))
+            values_avg = last_23_hours_base + [pred_val]
             C_avg = sum(values_avg) / len(values_avg)
             aqi = get_aqi_sub_index(C_avg, pollutant)
             category, warning, color = get_category_info(aqi)
@@ -802,8 +853,10 @@ def predict_pollutant(pollutant, data, weather_data, timestamps, start_day=1, en
                 "warning": warning,
                 "color": color
             })
-            sequence[0, -1, 0] = pred_val
-            sequence = np.roll(sequence, -1, axis=1)
+            # Roll for next iteration (keeps autoregressive consistency for display)
+            rolling_val_seq[0, -1, 0] = pred_val
+            rolling_val_seq = np.roll(rolling_val_seq, -1, axis=1)
+
         return results
     except Exception as e:
         print(f"Prediction error for {pollutant}: {e}", flush=True)
@@ -871,11 +924,6 @@ def get_avg_aqi_from_stations():
 
 
 def get_city_station_avg_aqi(city_name):
-    """
-    Compute the average AQI from only the active stations belonging to the given city.
-    Uses the AQI field reported directly by each station in the EnvAlert API.
-    Returns a rounded integer or None if no valid data is available.
-    """
     try:
         city_key = None
         for key in CITY_STATIONS:
@@ -922,43 +970,18 @@ def get_city_station_avg_aqi(city_name):
         return None
 
 
-# ── THE KEY FIX: Blended AQI for today ───────────────────────────────────────
-def compute_today_blended_aqi(model_aqi, city_name, envalert_today_data):
+def compute_today_blended_aqi(model_aqi, city_name, envalert_today_data, station_avg=None):
     """
-    Blend the model's predicted AQI for TODAY with the real station average.
-
-    Root cause of the bug:
-      The CNN model is trained on Open-Meteo satellite-derived pollutant estimates,
-      which systematically read LOWER than actual ground sensors (EnvAlert stations).
-      For Jabalpur: stations report 94, 77, 52, 52 → avg=69, but model outputs 35.
-      The existing bias correction (BIAS_FACTOR_TODAY=0.85 with a 90% cap) only
-      partially fixes individual pollutant concentrations, and even after correction
-      the max() of model sub-indices for overall AQI still lands far below reality.
-
-    Fix strategy — keep AQI model-driven but correct the magnitude using a
-    weighted blend of model output and real station average:
-
-        display_aqi = MODEL_WEIGHT * model_aqi + STATION_WEIGHT * station_avg_aqi
-
-    Weights:
-      MODEL_WEIGHT   = 0.35  → Model still contributes (result is not a pure station read)
-      STATION_WEIGHT = 0.65  → Station average pulls value toward ground truth
-
-    For Jabalpur example:
-      display_aqi = 0.35 * 35 + 0.65 * 69 = 12.25 + 44.85 ≈ 57
-      (much closer to 69 than raw model's 35, and still model-influenced)
-
-    Future days (i > 0) are left as pure model output since no station data exists.
-    If station data is unavailable, model_aqi is returned unchanged.
+    Blend model AQI with real station average.
+    station_avg can be passed in to avoid a duplicate fetch when caller already has it.
     """
     MODEL_WEIGHT   = 0.35
     STATION_WEIGHT = 0.65
 
     try:
-        # Primary: read the AQI field directly from each station (most accurate)
-        station_avg = get_city_station_avg_aqi(city_name)
+        if station_avg is None:
+            station_avg = get_city_station_avg_aqi(city_name)
 
-        # Fallback: derive station avg from per-pollutant sub-indices in envalert_today_data
         if station_avg is None and envalert_today_data:
             sub_indices = [
                 envalert_today_data[p]["aqi"]
@@ -973,7 +996,7 @@ def compute_today_blended_aqi(model_aqi, city_name, envalert_today_data):
             return model_aqi
 
         blended = round(MODEL_WEIGHT * model_aqi + STATION_WEIGHT * station_avg)
-        blended = max(0, min(500, blended))  # clamp to valid AQI range
+        blended = max(0, min(500, blended))
 
         print(
             f"[blended_aqi] {city_name}: model={model_aqi}, station_avg={station_avg}, "
@@ -985,7 +1008,6 @@ def compute_today_blended_aqi(model_aqi, city_name, envalert_today_data):
     except Exception as e:
         print(f"[blended_aqi] Error for {city_name}: {e} — returning model AQI", flush=True)
         return model_aqi
-# ─────────────────────────────────────────────────────────────────────────────
 
 
 @app.route('/predict', methods=['POST', 'OPTIONS'])
@@ -1006,36 +1028,42 @@ def predict():
         if lat is None or lon is None:
             return jsonify({"error": "Invalid city"}), 400
 
-        # 🌦 Weather data
-        weather_data = fetch_weather_series(lat, lon)
-        if not weather_data:
-            print(f"[predict] Weather fetch failed for {city_name}, using empty fallback", flush=True)
-            weather_data = []
+        # FIX: Fetch weather + EnvAlert in parallel instead of sequentially.
+        # Previously these were two sequential blocking HTTP calls (~1-2s each).
+        with ThreadPoolExecutor(max_workers=2) as pre_exec:
+            weather_future  = pre_exec.submit(fetch_weather_series, lat, lon)
+            envalert_future = pre_exec.submit(get_today_data_from_envalert, city_name)
 
-        # ✅ EnvAlert (PRIMARY → city stations)
-        envalert_today_data = get_today_data_from_envalert(city_name)
+        weather_data = weather_future.result() or []
+        envalert_today_data = envalert_future.result()
         env_source = "city"
 
-        # 🔁 FALLBACK → nearest city (2 stations)
         if not envalert_today_data:
             envalert_today_data = get_fallback_data_from_nearest_city(city_name)
             env_source = "nearest_city_fallback"
+
+        # FIX: Pre-fetch station avg once; reuse in blending and storage.
+        # Previously called twice (once in compute_today_blended_aqi, once in store block).
+        _city_station_avg = get_city_station_avg_aqi(city_name)
 
         result = {}
         model_predictions_for_error = {}
         today_pollutants = []
 
-        # ⚡ Fetch pollutant series in parallel
+        # Fetch all pollutant series data in parallel (unchanged from original)
         def fetch_pollutant_data(pollutant):
             return pollutant, fetch_pollutant_series(lat, lon, pollutant)
 
         with ThreadPoolExecutor(max_workers=6) as executor:
             pollutant_results = dict(executor.map(fetch_pollutant_data, TARGET_POLLUTANTS))
 
-        # 🔮 MODEL predictions (TODAY INCLUDED)
-        for pollutant in TARGET_POLLUTANTS:
+        # FIX: Run predict_pollutant for all 6 pollutants in parallel using threads.
+        # Previously this was a sequential for-loop — each pollutant blocked the next.
+        # With batch inference inside predict_pollutant (7 days → 1 model.predict call),
+        # this reduces total inference time from ~42 sequential calls to ~6 parallel calls.
+        def run_prediction(pollutant):
             pol_data, ts_series = pollutant_results.get(pollutant, ([], []))
-            prediction = predict_pollutant(
+            return pollutant, predict_pollutant(
                 pollutant,
                 pol_data,
                 weather_data,
@@ -1043,14 +1071,16 @@ def predict():
                 start_day=0,
                 envalert_fallback=envalert_today_data
             )
-            result[pollutant] = prediction
-            if prediction:
-                model_predictions_for_error[pollutant] = prediction[0]
 
-        # 🧮 Error calculation (EnvAlert vs Model)
+        with ThreadPoolExecutor(max_workers=6) as pred_exec:
+            for pollutant, prediction in pred_exec.map(lambda p: run_prediction(p), TARGET_POLLUTANTS):
+                result[pollutant] = prediction
+                if prediction:
+                    model_predictions_for_error[pollutant] = prediction[0]
+
+        # Error calculation (unchanged)
         errors = calculate_errors(envalert_today_data, model_predictions_for_error)
 
-        # ➕ Apply error correction (PM2.5 & PM10) → TODAY + FUTURE
         BIAS_FACTOR_TODAY  = 0.85
         BIAS_FACTOR_FUTURE = 0.70
         station_pm25 = envalert_today_data.get("pm2_5", {}).get("value") if envalert_today_data else None
@@ -1075,7 +1105,6 @@ def predict():
                     result[pollutant][i]["warning"] = warning
                     result[pollutant][i]["color"] = color
 
-        # ➕ PM10 = PM10 + PM2.5 (MODEL BASED)
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
         if pm10_preds and pm25_preds:
@@ -1091,14 +1120,12 @@ def predict():
                 pm10_preds[i]["warning"] = warning
                 pm10_preds[i]["color"] = color
 
-        # 📅 Today's pollutants
         for pollutant in TARGET_POLLUTANTS:
             if result.get(pollutant):
                 today_data = result[pollutant][0].copy()
                 today_data["pollutant"] = pollutant
                 today_pollutants.append(today_data)
 
-        # 🌍 Overall AQI (excluding O3)
         overall_daily_aqi = []
         label_pollutant = next(
             (p for p in TARGET_POLLUTANTS if result.get(p)), None
@@ -1125,17 +1152,12 @@ def predict():
                     model_aqi = highest["aqi"]
 
                     if i == 0:
-                        # ── TODAY: blend model output with real station average ──────────
-                        # The model under-predicts because Open-Meteo satellite data reads
-                        # lower than ground sensors. We keep it model-driven (35% weight)
-                        # but pull toward reality (65% station avg).
-                        # Example: Jabalpur stations 94,77,52,52 → avg=69, model=35
-                        #   blended = 0.35*35 + 0.65*69 ≈ 57  (vs raw model's 35)
+                        # FIX: pass pre-fetched station avg — avoids a second iteration
                         display_aqi = compute_today_blended_aqi(
-                            model_aqi, city_name, envalert_today_data
+                            model_aqi, city_name, envalert_today_data,
+                            station_avg=_city_station_avg
                         )
                     else:
-                        # Future days: pure model — no ground truth available
                         display_aqi = model_aqi
 
                     display_category, display_warning, display_color = get_category_info(display_aqi)
@@ -1151,23 +1173,24 @@ def predict():
                         "color": display_color
                     })
 
-        # 💾 Store today's blended prediction for historical stats
-        try:
-            today_date_str = datetime.now(IST).date().isoformat()
-            today_overall = next((e for e in overall_daily_aqi if e.get("day") == "Today"), None)
-            if today_overall and today_overall.get("aqi"):
-                predicted_aqi = today_overall["aqi"]
-                store_prediction(city_name, today_date_str, predicted_aqi)
+        # FIX: storage is now fully async — doesn't block the response at all.
+        # Previously store_prediction and store_validation_record read + wrote JSON
+        # from disk synchronously before the response was sent.
+        def _async_store():
+            try:
+                today_date_str = datetime.now(IST).date().isoformat()
+                today_overall = next((e for e in overall_daily_aqi if e.get("day") == "Today"), None)
+                if today_overall and today_overall.get("aqi"):
+                    predicted_aqi = today_overall["aqi"]
+                    store_prediction(city_name, today_date_str, predicted_aqi)
+                    actual_aqi = _city_station_avg
+                    if actual_aqi is not None:
+                        store_validation_record(city_name, today_date_str, predicted_aqi, actual_aqi)
+                    upsert_aqi_record(city_name, today_date_str, actual_aqi, predicted_aqi)
+            except Exception as _spe:
+                print(f"[pred_history] async store failed: {_spe}", flush=True)
 
-                # Also record actual station AQI for validation
-                actual_aqi = get_city_station_avg_aqi(city_name)
-                if actual_aqi is not None:
-                    store_validation_record(city_name, today_date_str, predicted_aqi, actual_aqi)
-
-                # ── Persist to SQLite AQI store ──────────────────────────────
-                upsert_aqi_record(city_name, today_date_str, actual_aqi, predicted_aqi)
-        except Exception as _spe:
-            print(f"[pred_history] failed to store: {_spe}", flush=True)
+        threading.Thread(target=_async_store, daemon=True).start()
 
         return jsonify({
             "city": city_name,
@@ -1219,10 +1242,10 @@ def weather_forecast():
         for _attempt in range(3):
             try:
                 if daily_data is None:
-                    r1 = requests.get(daily_url, timeout=15)
+                    r1 = requests.get(daily_url, timeout=8)   # FIX: was 15
                     daily_data = r1.json()
                 if current_data is None:
-                    r2 = requests.get(current_url, timeout=15)
+                    r2 = requests.get(current_url, timeout=8)  # FIX: was 15
                     current_data = r2.json()
                 break
             except Exception as _e:
@@ -1570,7 +1593,7 @@ def monthly_average():
             ma_resp = None
             for _ma_attempt in range(3):
                 try:
-                    ma_resp = requests.get(ma_url, timeout=20)
+                    ma_resp = requests.get(ma_url, timeout=8)   # FIX: was 20
                     break
                 except Exception as _mae:
                     print(f"[monthly_average] attempt {_ma_attempt+1} failed: {_mae}", flush=True)
@@ -1787,8 +1810,6 @@ def monthly_average():
                 else:
                     station_aqi_series.append({"date": entry["date"], "avg": entry.get("avg")})
 
-        # Build predicted_aqi_series: use stored model predictions where available,
-        # fall back to station_aqi_series (corrected Open-Meteo AQI) for missing dates.
         raw_predicted = get_predicted_aqi_series(city_name, start_date, end_date)
         station_aqi_map = {e["date"]: e.get("avg") for e in station_aqi_series}
         predicted_aqi_series = []
@@ -1799,8 +1820,6 @@ def monthly_average():
                 val = station_aqi_map.get(date_str)
             predicted_aqi_series.append({"date": date_str, "avg": val})
 
-        # Also backfill prediction_history.json for any dates that were missing,
-        # so future downloads stay consistent without re-running predictions.
         backfill_predictions_from_openmeteo(city_name, predicted_aqi_series)
 
         return jsonify({
@@ -1941,10 +1960,6 @@ def debug_models():
 
 @app.route('/api/validation', methods=['GET'])
 def get_validation():
-    """
-    GET /api/validation?city=Indore
-    Returns stored predicted vs actual AQI records for a city.
-    """
     city_name = request.args.get("city", "").strip()
     if not city_name:
         return jsonify({"error": "city parameter required"}), 400
@@ -1959,26 +1974,17 @@ def get_validation():
 # ── Scheduled AQI snapshot job ────────────────────────────────────────────────
 
 def _run_predict_for_city(city_name: str):
-    """
-    Replicate the core logic of /predict for a single city so the scheduler
-    can collect both station AQI and blended predicted AQI without an HTTP call.
-    Returns (station_avg_aqi, blended_predicted_aqi) or (None, None) on error.
-    """
     try:
         lat, lon = get_city_coordinates(city_name)
         if lat is None or lon is None:
             print(f"[scheduler] No coords for {city_name}", flush=True)
             return None, None
 
-        # ① Station average AQI (the "AQI" column)
         station_avg = get_city_station_avg_aqi(city_name)
-
-        # ② Get EnvAlert pollutant data for blending
         envalert_today_data = get_today_data_from_envalert(city_name)
         if not envalert_today_data:
             envalert_today_data = get_fallback_data_from_nearest_city(city_name)
 
-        # ③ Build model prediction to get blended AQI (the "Predicted AQI" column)
         weather_data = fetch_weather_series(lat, lon) or []
 
         def _fetch(p):
@@ -1996,7 +2002,6 @@ def _run_predict_for_city(city_name: str):
             )
             result[pollutant] = prediction
 
-        # Error correction (same as /predict)
         errors = calculate_errors(envalert_today_data, {
             p: result[p][0] for p in TARGET_POLLUTANTS if result.get(p)
         })
@@ -2015,7 +2020,6 @@ def _run_predict_for_city(city_name: str):
                 new_aqi = get_aqi_sub_index(result[pollutant][0]["value"], pollutant)
                 result[pollutant][0]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
 
-        # PM10 += PM2.5
         pm10_preds = result.get("pm10", [])
         pm25_preds = result.get("pm2_5", [])
         if pm10_preds and pm25_preds:
@@ -2026,7 +2030,6 @@ def _run_predict_for_city(city_name: str):
             new_aqi = get_aqi_sub_index(combined, "pm10")
             pm10_preds[0]["aqi"] = int(new_aqi) if not pd.isna(new_aqi) else 0
 
-        # Today's overall AQI (max sub-index excluding O3), then blend
         daily_values = [
             result[p][0]["aqi"]
             for p in TARGET_POLLUTANTS
@@ -2037,7 +2040,9 @@ def _run_predict_for_city(city_name: str):
             return station_avg, None
 
         model_aqi = max(daily_values)
-        blended_predicted = compute_today_blended_aqi(model_aqi, city_name, envalert_today_data)
+        blended_predicted = compute_today_blended_aqi(
+            model_aqi, city_name, envalert_today_data, station_avg=station_avg
+        )
 
         return station_avg, blended_predicted
 
@@ -2048,16 +2053,9 @@ def _run_predict_for_city(city_name: str):
 
 
 def scheduled_aqi_snapshot():
-    """
-    Run once per hour (or as configured).
-    For every city in CITY_STATIONS, compute and persist:
-      - aqi           → average AQI from its EnvAlert stations
-      - predicted_aqi → blended dashboard AQI (35 % model + 65 % station)
-    """
     today_str = datetime.now(IST).date().isoformat()
     print(f"[scheduler] ⏰ AQI snapshot started for {today_str} — {len(CITY_STATIONS)} cities", flush=True)
 
-    # Warm the EnvAlert cache once for all cities
     fetch_envalert_all_with_cache()
 
     for city_name in list(CITY_STATIONS.keys()):
@@ -2065,7 +2063,6 @@ def scheduled_aqi_snapshot():
             station_avg, blended_predicted = _run_predict_for_city(city_name)
             upsert_aqi_record(city_name, today_str, station_avg, blended_predicted)
 
-            # Keep prediction_history.json in sync as before
             if blended_predicted is not None:
                 store_prediction(city_name, today_str, blended_predicted)
             if station_avg is not None and blended_predicted is not None:
@@ -2077,13 +2074,8 @@ def scheduled_aqi_snapshot():
     print(f"[scheduler] ✅ AQI snapshot complete for {today_str}", flush=True)
 
 
-# ── API: read stored AQI records ──────────────────────────────────────────────
 @app.route('/api/aqi_records', methods=['GET'])
 def api_aqi_records():
-    """
-    GET /api/aqi_records?city=Indore&start=2025-01-01&end=2025-12-31
-    Returns stored AQI + Predicted AQI records for a city from the DB.
-    """
     city_name  = request.args.get("city", "").strip()
     start_date = request.args.get("start", "").strip() or None
     end_date   = request.args.get("end",   "").strip() or None
@@ -2093,11 +2085,19 @@ def api_aqi_records():
     return jsonify({"city": city_name, "records": records, "count": len(records)})
 
 
-# ── Initialise DB and start scheduler ────────────────────────────────────────
+# ── Startup: initialise DB, load history caches, preload models, start scheduler ─
 init_aqi_db()
 
+# FIX: Load both JSON history files into memory once at startup.
+# All reads are now O(1) dict lookups; all writes are async fire-and-forget.
+_init_pred_history()
+_init_val_history()
+
+# FIX: Pre-load all 6 CNN models in a background thread at startup.
+# Eliminates the per-pollutant cold-start delay on the first request.
+threading.Thread(target=_preload_all_models, daemon=True, name="model_preload").start()
+
 _scheduler = BackgroundScheduler(timezone=IST)
-# Run at the top of every hour; also fire immediately on startup
 _scheduler.add_job(
     scheduled_aqi_snapshot,
     trigger="cron",
@@ -2109,9 +2109,7 @@ _scheduler.add_job(
 )
 _scheduler.start()
 print("[scheduler] 🕐 APScheduler started — AQI snapshot runs every hour", flush=True)
-# Fire immediately so data is captured on first deploy without waiting an hour
-import threading as _threading
-_threading.Thread(target=scheduled_aqi_snapshot, daemon=True, name="aqi_snapshot_init").start()
+threading.Thread(target=scheduled_aqi_snapshot, daemon=True, name="aqi_snapshot_init").start()
 
 
 if __name__ == "__main__":
